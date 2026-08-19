@@ -6,7 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-ALLOWED_VOICE_ACTIONS = frozenset({"toggle", "turn_off", "turn_on"})
+ALLOWED_VOICE_ACTIONS = frozenset({"press", "toggle", "turn_off", "turn_on"})
 _ENTITY_ID_PATTERN = re.compile(r"[a-z_][a-z0-9_]*\.[a-z0-9_]+")
 
 
@@ -71,7 +71,7 @@ def parse_voice_command_rules(value: str) -> tuple[VoiceCommandRule, ...]:
         if len(parts) != 3:
             raise VoiceCommandRulesError(
                 line_number,
-                "expected 'phrase | entity_id | turn_on/turn_off/toggle'",
+                "expected 'phrase | entity_id | press/turn_on/turn_off/toggle'",
             )
 
         phrase, entity_id, action = parts
@@ -87,7 +87,7 @@ def parse_voice_command_rules(value: str) -> tuple[VoiceCommandRule, ...]:
         if action not in ALLOWED_VOICE_ACTIONS:
             raise VoiceCommandRulesError(
                 line_number,
-                "action must be turn_on, turn_off or toggle",
+                "action must be press, turn_on, turn_off or toggle",
             )
 
         if normalized_phrase in seen_phrases:
