@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+*.zip
+.dev.vars
+.env
+.env.*
+.vercel/
+.wrangler/
+node_modules/
+secrets.yaml
+
+.codewhale/
