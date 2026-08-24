@@ -2,18 +2,6 @@
   "title": "MAIKA Speaker",
   "config": {
     "step": {
-      "user": {
-        "title": "Activate MAIKA Speaker",
-        "description": "Installation code: {activation_code}. Enter the activation server URL supplied by the seller and your license key. Only a hash derived from the Home Assistant instance ID is sent; MAIKA credentials are never sent to the activation server.",
-        "data": {
-          "license_server_url": "Activation server URL",
-          "license_key": "License key"
-        }
-      },
-      "activation_pending": {
-        "title": "Waiting for approval",
-        "description": "Installation code: {activation_code}. Send this code to the seller. After the installation is approved, select Submit to check again."
-      },
       "account": {
         "title": "Connect a MAIKA account",
         "description": "Enter a phone number or an email/Gmail address registered with MAIKA. Email login requires the MAIKA account password; Google Sign-In without a MAIKA password is not supported. Credentials are sent only to the MAIKA cloud, never to the activation server.",
@@ -33,19 +21,7 @@
     },
     "error": {
       "cannot_connect": "Unable to connect to the MAIKA cloud.",
-      "cannot_connect_license": "Unable to connect to the activation server.",
-      "invalid_license": "The license key is invalid.",
-      "invalid_license_key": "Enter a valid license key.",
-      "invalid_license_response": "The activation server returned an invalid or unsigned license.",
-      "invalid_server_url": "Enter a valid HTTPS activation server URL using a hostname.",
       "invalid_auth": "Invalid phone number, email, or password.",
-      "license_activation_limit": "This license has reached its installation limit.",
-      "license_deactivated": "This installation was deactivated.",
-      "license_expired": "This license has expired.",
-      "license_inactive": "This license is inactive.",
-      "license_pending": "The installation is still waiting for seller approval.",
-      "license_rejected": "The activation request was rejected.",
-      "license_revoked": "This installation was revoked.",
       "unknown": "Unexpected error. Check the Home Assistant log."
     },
     "abort": {
@@ -57,64 +33,31 @@
   },
   "options": {
     "step": {
-      "init": {
-        "title": "MAIKA options",
-        "menu_options": {
-          "license": "License and activation",
-          "features": "Speaker features"
-        }
-      },
-      "license": {
-        "title": "License and activation",
-        "description": "Installation code: {activation_code}. Current status: {license_status}. Leave the license key blank to refresh the existing activation, or enter a new key to replace it.",
-        "data": {
-          "license_server_url": "Activation server URL",
-          "license_key": "New license key (optional)"
-        }
-      },
-      "license_pending": {
-        "title": "Waiting for approval",
-        "description": "Installation code: {activation_code}. Send this code to the seller. After approval, select Submit to check again."
-      },
       "features": {
         "title": "MAIKA options",
-        "description": "Experimental features are off by default. Enabling the voice command sensor stores recognized phrases in Home Assistant state and may record them in history. Rules use exact accent-insensitive matching and can only turn on, turn off or toggle one entity. Enter an optional HTTP(S) MP3 URL to play it only after a matched Home Assistant action completes successfully. Leave the URL blank to disable feedback. If this entry has one MAIKA speaker it is selected automatically; unmatched or failed commands never send playback commands.",
+        "description": "Experimental features are off by default. Enabling the voice command sensor stores recognized phrases in Home Assistant state and may record them in history. Rules use exact accent-insensitive matching and can only turn on, turn off or toggle one entity. Choose disabled, the bundled MAIKA MP3, or a custom HTTP(S) MP3 URL. Audio is sent only after a matched Home Assistant action completes successfully. If this entry has one MAIKA speaker it is selected automatically; unmatched or failed commands never send playback commands.",
         "data": {
           "scan_interval": "Polling interval (seconds)",
           "enable_experimental_cloud_cast": "Enable experimental cloud audio cast",
           "enable_voice_command_sensor": "Enable latest voice command sensor and rules",
           "voice_command_rules": "Rules, one per line: phrase | entity_id | turn_on/turn_off/toggle",
-          "voice_success_audio_url": "Success MP3 URL (blank disables feedback)",
+          "voice_success_audio_source": "Success audio source",
+          "voice_success_audio_url": "Custom success MP3 URL",
           "voice_success_media_player_entity_id": "MAIKA speaker for success audio"
         }
       }
     },
     "error": {
-      "cannot_connect_license": "Unable to connect to the activation server.",
-      "invalid_license": "The license key is invalid.",
-      "invalid_license_key": "Enter a valid license key.",
-      "invalid_license_response": "The activation server returned an invalid or unsigned license.",
-      "invalid_server_url": "Enter a valid HTTPS activation server URL using a hostname.",
       "invalid_voice_command_rules": "Invalid voice command rules: {rule_error}",
-      "license_activation_limit": "This license has reached its installation limit.",
-      "license_deactivated": "This installation was deactivated.",
-      "license_expired": "This license has expired.",
-      "license_inactive": "This license is inactive.",
-      "license_key_required": "Enter a license key to activate this installation.",
-      "license_pending": "The installation is still waiting for seller approval.",
-      "license_rejected": "The activation request was rejected.",
-      "license_revoked": "This installation was revoked.",
       "voice_success_audio_requires_voice_sensor": "Enable the latest voice command sensor and rules first.",
       "voice_success_audio_requires_cloud_cast": "Enable experimental MAIKA cloud audio cast first.",
+      "voice_success_audio_bundled_unavailable": "The bundled MAIKA MP3 is not available in this build.",
       "voice_success_audio_url_invalid": "Enter a valid HTTP(S) audio URL without spaces or embedded credentials.",
       "voice_success_audio_media_player_required": "Select a MAIKA speaker when this entry has more than one speaker.",
       "voice_success_audio_media_player_invalid": "Select a MAIKA media player from this integration entry."
     }
   },
   "exceptions": {
-    "license_unavailable": {
-      "message": "MAIKA license unavailable ({license_error}). Installation code: {activation_code}. Open the integration options to activate this Home Assistant instance."
-    },
     "cloud_cast_disabled": {
       "message": "Experimental MAIKA cloud cast is disabled in the integration options."
     },
@@ -129,6 +72,15 @@
     },
     "cloud_cast_unsupported_mode": {
       "message": "MAIKA cloud cast does not support enqueue=add or enqueue=next."
+    }
+  },
+  "selector": {
+    "voice_success_audio_source": {
+      "options": {
+        "disabled": "Disabled",
+        "bundled": "Bundled MAIKA MP3",
+        "custom": "Custom MP3 URL"
+      }
     }
   },
   "entity": {
