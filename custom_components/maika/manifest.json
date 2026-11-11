@@ -1,13 +1,18 @@
 {
   "domain": "maika",
   "name": "MAIKA Speaker",
-  "codeowners": ["@PentaKingz"],
+  "codeowners": [
+    "@trankhanhduy2929-beep"
+  ],
   "config_flow": true,
-  "dependencies": ["media_source"],
-  "documentation": "https://github.com/PentaKingz/HASpeak",
+  "dependencies": [
+    "media_source",
+    "http"
+  ],
+  "documentation": "https://github.com/trankhanhduy2929-beep/loa-maika-home-assistant",
   "integration_type": "device",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/PentaKingz/HASpeak/issues",
+  "issue_tracker": "https://github.com/trankhanhduy2929-beep/loa-maika-home-assistant/issues",
   "requirements": [],
-  "version": "1.8.1"
+  "version": "1.29.9"
 }

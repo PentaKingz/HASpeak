@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from .const import (
+    BUNDLED_VOICE_SUCCESS_AUDIO_URL,
+    CONF_VOICE_SUCCESS_AUDIO_PATH,
     CONF_VOICE_SUCCESS_AUDIO_SOURCE,
     CONF_VOICE_SUCCESS_AUDIO_TIMING,
     CONF_VOICE_SUCCESS_AUDIO_URL,
@@ -12,6 +14,7 @@ from .const import (
     DEFAULT_VOICE_SUCCESS_AUDIO_TIMING,
     VOICE_SUCCESS_AUDIO_SOURCE_BUNDLED,
     VOICE_SUCCESS_AUDIO_SOURCE_CUSTOM,
+    VOICE_SUCCESS_AUDIO_SOURCE_LIBRARY,
     VOICE_SUCCESS_AUDIO_SOURCE_OPTIONS,
     VOICE_SUCCESS_AUDIO_TIMING_OPTIONS,
 )
@@ -33,10 +36,18 @@ def resolve_voice_success_audio_url(options: Mapping[str, object]) -> str:
     custom_url = str(options.get(CONF_VOICE_SUCCESS_AUDIO_URL, "")).strip()
 
     if source == VOICE_SUCCESS_AUDIO_SOURCE_BUNDLED:
-        return ""
+        return BUNDLED_VOICE_SUCCESS_AUDIO_URL.strip()
     if source == VOICE_SUCCESS_AUDIO_SOURCE_CUSTOM:
         return custom_url
     return ""
+
+
+def resolve_voice_success_audio_path(options: Mapping[str, object]) -> str:
+    """Return the stored local library path, or an empty string."""
+    source = resolve_voice_success_audio_source(options)
+    if source != VOICE_SUCCESS_AUDIO_SOURCE_LIBRARY:
+        return ""
+    return str(options.get(CONF_VOICE_SUCCESS_AUDIO_PATH, "") or "").strip()
 
 
 def resolve_voice_success_audio_timing(options: Mapping[str, object]) -> str:
@@ -48,5 +59,12 @@ def resolve_voice_success_audio_timing(options: Mapping[str, object]) -> str:
 
 
 def has_voice_success_audio(options: Mapping[str, object]) -> bool:
-    """Return whether a source has been selected and resolved to a URL."""
-    return bool(resolve_voice_success_audio_url(options))
+    """Return whether a playable source has been selected.
+
+    Library entries resolve to an absolute URL at play time, so a stored
+    path already counts as configured here.
+    """
+    return bool(
+        resolve_voice_success_audio_url(options)
+        or resolve_voice_success_audio_path(options)
+    )

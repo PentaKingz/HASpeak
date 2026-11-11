@@ -8,7 +8,9 @@ import codecs
 import json
 import logging
 import time
-from collections.abc import Callable
+import unicodedata
+from collections.abc import Callable, Sequence
+from copy import deepcopy
 from typing import Any
 from uuid import uuid4
 
@@ -16,13 +18,17 @@ import aiohttp
 
 from .const import (
     APP_DEVICE_TYPE,
+    APP_EXECUTOR,
     APP_LANGUAGE,
     APP_ORGANIZATION_CODE,
     APP_TIMEZONE,
     APP_VERSION,
     CHATBOT_BASE_URL,
+    CONTENT_GATEWAY_BASE_URL,
+    CONTENT_STORE_GRAPHQL_URL,
     DEVICE_DISCOVERY_FIELDS,
     DEVICE_INFO_FIELDS,
+    NCT_API_BASE_URL,
     REST_UPDATE_FIELDS,
     USERS_BASE_URL,
 )
@@ -37,6 +43,7 @@ STREAM_TIMEOUT = aiohttp.ClientTimeout(
     sock_connect=30,
     sock_read=180,
 )
+_STREAM_HANDSHAKE_TIMEOUT = 30.0
 
 _FRAME_START = "$START_JSON"
 _FRAME_END = "$END_JSON"
@@ -84,6 +91,44 @@ _STREAM_DEVICE_FIELDS = frozenset(
 )
 
 
+def merge_current_playback(current: Any, changes: Any) -> Any:
+    if not isinstance(current, dict) or not isinstance(changes, dict):
+        return deepcopy(changes)
+    merged = {**deepcopy(current), **deepcopy(changes)}
+    current_payload = current.get("payload")
+    payload = changes.get("payload")
+    if not isinstance(current_payload, dict) or not isinstance(payload, dict):
+        return merged
+    current_attributes = current_payload.get("playbackAttributes")
+    attributes = payload.get("playbackAttributes")
+    if isinstance(attributes, dict):
+        previous = current_attributes if isinstance(current_attributes, dict) else {}
+        if any(
+            key in attributes and attributes[key] != previous.get(key)
+            for key in (
+                "songKey",
+                "key",
+                "url",
+                "id",
+                "mediaId",
+                "media_id",
+                "title",
+                "song",
+                "name",
+            )
+        ):
+            merged["payload"] = deepcopy(payload)
+            return merged
+    merged_payload = {**deepcopy(current_payload), **deepcopy(payload)}
+    if isinstance(current_attributes, dict) and isinstance(attributes, dict):
+        merged_payload["playbackAttributes"] = {
+            **deepcopy(current_attributes),
+            **deepcopy(attributes),
+        }
+    merged["payload"] = merged_payload
+    return merged
+
+
 class MaikaApiError(Exception):
     """Base MAIKA API error."""
 
@@ -105,6 +150,46 @@ class MaikaConnectionError(MaikaApiError):
         return self.status is not None and 500 <= self.status < 600
 
 
+_FAVORITE_PLAYLIST_TITLES = frozenset(
+    {
+        "bai hat yeu thich",
+        "yeu thich",
+        "favorite",
+        "favorites",
+        "favourite",
+        "favourites",
+        "my favorite",
+        "my favorites",
+        "my favourite",
+        "my favourites",
+    }
+)
+
+
+def _normalize_playlist_title(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value)
+    ascii_value = "".join(
+        char for char in decomposed if not unicodedata.combining(char)
+    )
+    return " ".join(ascii_value.casefold().split())
+
+
+def _is_favorite_playlist_title(title: str) -> bool:
+    if title in _FAVORITE_PLAYLIST_TITLES:
+        return True
+    return any(token in title for token in ("yeu thich", "favorite", "favourite"))
+
+
+def _first_text(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, bool) or value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
 class MaikaApiClient:
     """Asynchronous MAIKA cloud client."""
 
@@ -124,6 +209,7 @@ class MaikaApiClient:
 
         self._access_token: str | None = None
         self._user_id: int | None = None
+        self._favorite_playlist_id: int | str | None = None
         self._token_valid_until = 0.0
         self._auth_lock = asyncio.Lock()
 
@@ -143,6 +229,11 @@ class MaikaApiClient:
     def user_id(self) -> int | None:
         """Return the authenticated MAIKA user ID."""
         return self._user_id
+
+    @property
+    def favorite_playlist_id(self) -> int | str | None:
+        """Return the account's favorite playlist ID when available."""
+        return self._favorite_playlist_id
 
     @property
     def listener_connected(self) -> bool:
@@ -209,12 +300,255 @@ class MaikaApiClient:
                 "MAIKA login did not return a valid user ID"
             ) from err
 
+        favorite_value = data.get("favorite_playlist_id")
+        self._favorite_playlist_id = (
+            int(favorite_value)
+            if isinstance(favorite_value, (int, str))
+            and str(favorite_value).strip().isdigit()
+            and int(favorite_value) > 0
+            else None
+        )
+
         try:
             expires_in = int(data.get("expire_time", 86400))
         except (TypeError, ValueError):
             expires_in = 86400
         self._token_valid_until = time.monotonic() + max(1, expires_in - 60)
         return data
+
+    async def _async_list_playlist_songs_page(
+        self,
+        playlist_id: int | str,
+        *,
+        page: int,
+        limit: int,
+        order_by: str,
+    ) -> tuple[list[dict[str, Any]], int]:
+        response = await self._async_request_json(
+            "GET",
+            f"{USERS_BASE_URL}/v1/playlists/{playlist_id}/songs",
+            params={"page": page, "limit": limit, "order_by": order_by},
+        )
+        data = response.get("data")
+        songs = data.get("songs") if isinstance(data, dict) else None
+        meta = response.get("meta_data")
+        if not isinstance(meta, dict) and isinstance(data, dict):
+            meta = data.get("meta_data")
+        total_pages = 1
+        if isinstance(meta, dict):
+            raw_total = meta.get("total_page")
+            if isinstance(raw_total, (int, str)) and str(raw_total).strip().isdigit():
+                total_pages = int(raw_total)
+        return (
+            [song for song in songs if isinstance(song, dict)]
+            if isinstance(songs, list)
+            else [],
+            max(1, total_pages),
+        )
+
+    async def async_list_playlists(self) -> list[dict[str, Any]]:
+        """Return every MAIKA playlist for the authenticated account."""
+        response = await self._async_request_json(
+            "GET",
+            f"{USERS_BASE_URL}/v1/playlist",
+            params={"page": 1, "limit": 1000, "order_by": "oldest"},
+        )
+        data = response.get("data")
+        if isinstance(data, dict):
+            data = data.get("playlists") or data.get("items") or data.get("data")
+        if not isinstance(data, list):
+            return []
+        return [playlist for playlist in data if isinstance(playlist, dict)]
+
+    @staticmethod
+    def _playlist_id(playlist: dict[str, Any]) -> int | str | None:
+        """Return the API identifier for a playlist entry."""
+        candidate = _first_text(
+            playlist.get("listKey"),
+            playlist.get("list_key"),
+            playlist.get("id"),
+            playlist.get("playlist_id"),
+            playlist.get("key"),
+        )
+        if candidate is None:
+            return None
+        if candidate.lstrip("-").isdigit():
+            return int(candidate)
+        return candidate
+
+    async def async_resolve_favorite_playlist_id(
+        self, *, force: bool = False
+    ) -> int | str | None:
+        """Resolve the favorite playlist even when login omits its ID."""
+        if self._favorite_playlist_id is not None and not force:
+            return self._favorite_playlist_id
+        playlists = await self.async_list_playlists()
+        for playlist in playlists:
+            title = _normalize_playlist_title(
+                _first_text(playlist.get("title"), playlist.get("name"))
+            )
+            if not _is_favorite_playlist_title(title):
+                continue
+            if (candidate := self._playlist_id(playlist)) is not None:
+                self._favorite_playlist_id = candidate
+                return candidate
+        cached = self._favorite_playlist_id
+        if cached is not None and any(
+            self._playlist_id(playlist) == cached for playlist in playlists
+        ):
+            return cached
+        self._favorite_playlist_id = None
+        return None
+
+    async def async_list_playlist_songs(
+        self,
+        playlist_id: int | str,
+        *,
+        page: int = 1,
+        limit: int = 100,
+        order_by: str = "latest",
+    ) -> list[dict[str, Any]]:
+        """Return one page of songs from a MAIKA playlist."""
+        songs, _ = await self._async_list_playlist_songs_page(
+            playlist_id, page=page, limit=limit, order_by=order_by
+        )
+        return songs
+
+    async def async_list_all_playlist_songs(
+        self,
+        playlist_id: int | str,
+        *,
+        limit: int = 100,
+        order_by: str = "latest",
+        max_pages: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return every MAIKA playlist page, capped to avoid unbounded requests."""
+        songs, total_pages = await self._async_list_playlist_songs_page(
+            playlist_id, page=1, limit=limit, order_by=order_by
+        )
+        for page in range(2, min(total_pages, max(1, max_pages)) + 1):
+            page_songs, _ = await self._async_list_playlist_songs_page(
+                playlist_id, page=page, limit=limit, order_by=order_by
+            )
+            songs.extend(page_songs)
+        return songs
+
+    async def async_add_song_to_playlist(
+        self,
+        playlist_id: int | str,
+        *,
+        singer: str,
+        song_id: str,
+        song_name: str,
+        song_url: str,
+        lyric: str = "",
+        source: str | None = None,
+        status: int = 0,
+        image_url: str = "",
+    ) -> dict[str, Any]:
+        """Add one song using the same payload as the MAIKA app."""
+        body = {
+            "singer": singer,
+            "song_id": song_id,
+            "song_name": song_name,
+            "song_url": song_url,
+            "lyric": lyric,
+            "status": status,
+            "imageURL": image_url,
+        }
+        if source:
+            body["source"] = source
+        return await self._async_request_json(
+            "POST",
+            f"{USERS_BASE_URL}/v1/playlists/{playlist_id}/songs",
+            json_body=body,
+        )
+
+    async def async_list_reminders(self) -> list[dict[str, Any]]:
+        """Return reminder groups from the MAIKA cloud."""
+        response = await self._async_request_json(
+            "GET",
+            f"{USERS_BASE_URL}/v1/reminder",
+            params={"page": 0, "limit": 1000},
+        )
+        data = response.get("data")
+        if not isinstance(data, list):
+            return []
+        return [group for group in data if isinstance(group, dict)]
+
+    async def async_create_reminder(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a reminder through the MAIKA cloud."""
+        return await self._async_request_json(
+            "POST", f"{USERS_BASE_URL}/v1/reminder", json_body=payload
+        )
+
+    async def async_update_reminder(
+        self,
+        reminder_id: int | str,
+        payload: dict[str, Any],
+        *,
+        not_sync: bool = False,
+    ) -> dict[str, Any]:
+        """Update one reminder through the MAIKA cloud."""
+        return await self._async_request_json(
+            "PUT",
+            f"{USERS_BASE_URL}/v1/reminder/{int(reminder_id)}",
+            params={"not_sync": str(not_sync).lower()},
+            json_body=payload,
+        )
+
+    async def async_delete_reminder(
+        self, reminder_id: int | str, *, executor: str = APP_EXECUTOR
+    ) -> dict[str, Any]:
+        """Delete one reminder through the MAIKA cloud."""
+        return await self._async_request_json(
+            "DELETE",
+            f"{USERS_BASE_URL}/v1/reminder/{int(reminder_id)}",
+            json_body={
+                "executor": executor,
+                "all": False,
+                "reminder_ids": [int(reminder_id)],
+            },
+        )
+
+    async def async_delete_reminders(
+        self,
+        reminder_ids: Sequence[int | str],
+        *,
+        delete_all: bool = False,
+        executor: str = APP_EXECUTOR,
+    ) -> dict[str, Any]:
+        """Delete one or more reminders through the MAIKA cloud."""
+        ids = [int(reminder_id) for reminder_id in reminder_ids]
+        if not ids and not delete_all:
+            raise ValueError("At least one reminder ID is required")
+        return await self._async_request_json(
+            "DELETE",
+            f"{USERS_BASE_URL}/v1/reminder",
+            json_body={
+                "executor": executor,
+                "all": bool(delete_all),
+                "reminder_ids": None if delete_all else ids,
+            },
+        )
+
+    async def async_mute_reminders(
+        self,
+        reminder_ids: Sequence[int | str],
+        mute_days: Sequence[str],
+        *,
+        executor: str = APP_EXECUTOR,
+    ) -> dict[str, Any]:
+        """Mute reminders for the provided dates through the MAIKA cloud."""
+        return await self._async_request_json(
+            "POST",
+            f"{USERS_BASE_URL}/v1/reminder/mute",
+            json_body={
+                "executor": executor,
+                "mute_days": list(mute_days),
+                "reminder_ids": [int(reminder_id) for reminder_id in reminder_ids],
+            },
+        )
 
     async def async_list_devices(self) -> list[dict[str, Any]]:
         """Return all MAIKA speakers registered to the account."""
@@ -411,10 +745,19 @@ class MaikaApiClient:
         if not isinstance(serial_number, str) or not serial_number:
             return
         current = self._discovered_devices.get(serial_number, {})
-        self._discovered_devices[serial_number] = {
+        merged = {
             **current,
-            **{key: value for key, value in device.items() if value is not None},
+            **{
+                key: deepcopy(value)
+                for key, value in device.items()
+                if value is not None or key in {"current_playback", "latest_playlist"}
+            },
         }
+        if "current_playback" in device:
+            merged["current_playback"] = merge_current_playback(
+                current.get("current_playback"), device["current_playback"]
+            )
+        self._discovered_devices[serial_number] = merged
 
     def _copy_discovered_devices(self) -> list[dict[str, Any]]:
         """Return defensive copies of cached discovered speakers."""
@@ -580,15 +923,32 @@ class MaikaApiClient:
             {"deviceId": serial_number, "type": "conversation"},
         )
 
+    async def async_start_media_listening(self, serial_number: str) -> None:
+        await self.async_send_command(
+            "StartListening",
+            "Conversation",
+            {"deviceId": serial_number, "type": "media_control"},
+        )
+
+    async def async_stop_media_listening(self, serial_number: str) -> None:
+        await self.async_send_command(
+            "StopListening",
+            "Conversation",
+            {"deviceId": serial_number, "type": "media_control"},
+        )
+
     async def async_request_device_info(
         self, serial_number: str, timeout_seconds: float = 8.0
     ) -> dict[str, Any] | None:
         """Request live playback, volume and microphone state over /connect."""
-        cached = self.live_device_info.get(serial_number)
+        if self._stopping:
+            return None
         try:
             await asyncio.wait_for(self._connected.wait(), timeout=timeout_seconds)
         except TimeoutError:
-            return cached
+            return None
+        if self._stopping:
+            return None
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -605,8 +965,10 @@ class MaikaApiClient:
             )
             return await asyncio.wait_for(future, timeout=timeout_seconds)
         except TimeoutError:
-            return self.live_device_info.get(serial_number, cached)
+            return None
         finally:
+            if not future.done():
+                future.cancel()
             current_waiters = self._device_info_waiters.get(serial_number)
             if current_waiters and future in current_waiters:
                 current_waiters.remove(future)
@@ -637,11 +999,41 @@ class MaikaApiClient:
             retry_auth=retry_auth,
         )
 
+    async def async_send_voice_text(
+        self,
+        serial_number: str,
+        text: str,
+        *,
+        retry_auth: bool = True,
+    ) -> None:
+        """Send a typed utterance to one speaker as if it had been recognized.
+
+        Mirrors the MAIKA app, which posts a ``Recognize`` event in the
+        ``SpeechRecognizer`` namespace carrying the text in ``rawSpeech`` and
+        targets the selected speaker through the ``device-id`` header.
+        """
+        await self._async_send_stream_meta(
+            {
+                "event": {
+                    "header": {
+                        "dialogRequestId": str(uuid4()),
+                        "messageId": f"messageId-{uuid4()}",
+                        "name": "Recognize",
+                        "namespace": "SpeechRecognizer",
+                        "rawSpeech": text,
+                    }
+                }
+            },
+            retry_auth=retry_auth,
+            device_id=serial_number,
+        )
+
     async def _async_send_stream_meta(
         self,
         meta: dict[str, Any],
         *,
         retry_auth: bool = True,
+        device_id: str | None = None,
     ) -> None:
         """Send an allowlisted MAIKA metadata envelope through chatbot /stream."""
         await self._async_ensure_authenticated()
@@ -652,7 +1044,7 @@ class MaikaApiClient:
             json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode()
         ).decode()
 
-        headers = self._stream_headers(encoded_meta)
+        headers = self._stream_headers(encoded_meta, device_id=device_id)
         try:
             async with self._session.post(
                 f"{CHATBOT_BASE_URL}/stream",
@@ -664,7 +1056,9 @@ class MaikaApiClient:
                     await response.read()
                     self._clear_authentication()
                     await self._async_ensure_authenticated()
-                    await self._async_send_stream_meta(meta, retry_auth=False)
+                    await self._async_send_stream_meta(
+                        meta, retry_auth=False, device_id=device_id
+                    )
                     return
                 if response.status in (401, 403):
                     raise MaikaAuthenticationError(
@@ -711,16 +1105,30 @@ class MaikaApiClient:
                             f"MAIKA event stream returned HTTP {response.status}"
                         )
 
-                    retry_delay = 1
                     buffer = ""
                     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-                    async for chunk in response.content.iter_any():
+                    chunks = response.content.iter_any().__aiter__()
+                    handshake_received = False
+                    while True:
+                        try:
+                            if handshake_received:
+                                chunk = await chunks.__anext__()
+                            else:
+                                chunk = await asyncio.wait_for(
+                                    chunks.__anext__(),
+                                    timeout=_STREAM_HANDSHAKE_TIMEOUT,
+                                )
+                        except StopAsyncIteration:
+                            break
                         if self._stopping:
                             return
                         buffer += decoder.decode(chunk)
                         frames, buffer = self._extract_frames(buffer)
                         for frame in frames:
                             self._handle_stream_frame(frame)
+                        if not handshake_received and self._connected.is_set():
+                            handshake_received = True
+                            retry_delay = 1
             except asyncio.CancelledError:
                 raise
             except MaikaAuthenticationError:
@@ -735,6 +1143,10 @@ class MaikaApiClient:
                 self._connected.clear()
                 if not self._stopping:
                     _LOGGER.debug("MAIKA event stream disconnected: %s", err)
+            except Exception:
+                self._connected.clear()
+                if not self._stopping:
+                    _LOGGER.exception("Unexpected MAIKA event stream failure")
 
             self._connected.clear()
 
@@ -821,6 +1233,164 @@ class MaikaApiClient:
             )
         return payload
 
+    async def async_chat_ai(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+        retry_auth: bool = True,
+    ) -> str:
+        """Stream MAIKA's AI chat reply using the original app endpoint."""
+        text = message.strip()
+        if not text:
+            return ""
+        await self._async_ensure_authenticated()
+        session = session_id or f"{self._user_id or 0}_{self._client_id}"
+        try:
+            async with self._session.post(
+                f"{CONTENT_GATEWAY_BASE_URL}/api/chat",
+                json={
+                    "message": text,
+                    "enable_search": False,
+                    "session_id": session,
+                },
+                headers=self._rest_headers(include_authorization=True),
+                timeout=STREAM_TIMEOUT,
+            ) as response:
+                if response.status == 401 and retry_auth:
+                    await response.read()
+                    self._clear_authentication()
+                    return await self.async_chat_ai(
+                        text, session_id=session, retry_auth=False
+                    )
+                if response.status in (401, 403):
+                    await response.read()
+                    raise MaikaAuthenticationError(
+                        "MAIKA AI chat authentication failed"
+                    )
+                if response.status >= 400:
+                    await response.read()
+                    raise MaikaConnectionError(
+                        f"MAIKA AI chat returned HTTP {response.status}",
+                        status=response.status,
+                    )
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                chunks: list[str] = []
+                async for chunk in response.content.iter_any():
+                    chunks.append(decoder.decode(chunk))
+                chunks.append(decoder.decode(b"", final=True))
+                return "".join(chunks).strip()
+        except MaikaApiError:
+            raise
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise MaikaConnectionError("Unable to chat with MAIKA") from err
+
+    async def async_get_message_history(
+        self,
+        serial_number: str,
+        *,
+        limit: int = 10,
+        page: int = 0,
+        newest: bool = True,
+        retry_auth: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return recent speaker chat exchanges from the app account API."""
+        response = await self._async_request_json(
+            "GET",
+            f"{USERS_BASE_URL}/v2/user/message-history",
+            params={
+                "limit": limit,
+                "page": page,
+                "device_id": serial_number,
+                "newest": str(bool(newest)).lower(),
+            },
+            retry_auth=retry_auth,
+        )
+        data = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+
+    async def async_nct_json(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run a public NhacCuaTui API request."""
+        try:
+            async with self._session.get(
+                f"{NCT_API_BASE_URL}{path}",
+                params=params,
+                headers={"Accept": "application/json"},
+                timeout=REQUEST_TIMEOUT,
+            ) as response:
+                if response.status >= 400:
+                    await response.read()
+                    raise MaikaConnectionError(
+                        f"NhacCuaTui API returned HTTP {response.status}",
+                        status=response.status,
+                    )
+                payload = await self._read_json(response)
+        except MaikaApiError:
+            raise
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise MaikaConnectionError("Unable to communicate with NhacCuaTui") from err
+
+        if not isinstance(payload, dict):
+            raise MaikaConnectionError("NhacCuaTui returned invalid JSON")
+        code = payload.get("code")
+        if code not in (None, 0, 200):
+            raise MaikaConnectionError(f"NhacCuaTui API returned code {code}")
+        return payload
+
+    async def async_graphql(
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        retry_auth: bool = True,
+    ) -> dict[str, Any]:
+        """Run a Content Store GraphQL operation with the MAIKA session token."""
+        await self._async_ensure_authenticated()
+        try:
+            async with self._session.post(
+                CONTENT_STORE_GRAPHQL_URL,
+                json={"query": query, "variables": variables or {}},
+                headers=self._rest_headers(include_authorization=True),
+                timeout=REQUEST_TIMEOUT,
+            ) as response:
+                if response.status == 401 and retry_auth:
+                    await response.read()
+                    self._clear_authentication()
+                    await self._async_ensure_authenticated()
+                    return await self.async_graphql(query, variables, retry_auth=False)
+                if response.status in (401, 403):
+                    await response.read()
+                    raise MaikaAuthenticationError("MAIKA authentication failed")
+                if response.status >= 400:
+                    await response.read()
+                    raise MaikaConnectionError(
+                        f"MAIKA Content Store returned HTTP {response.status}",
+                        status=response.status,
+                    )
+                payload = await self._read_json(response)
+        except MaikaApiError:
+            raise
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise MaikaConnectionError(
+                "Unable to communicate with MAIKA Content Store"
+            ) from err
+
+        if not isinstance(payload, dict):
+            raise MaikaConnectionError("MAIKA Content Store returned invalid JSON")
+        errors = payload.get("errors")
+        if errors:
+            raise MaikaConnectionError("MAIKA Content Store returned errors")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise MaikaConnectionError("MAIKA Content Store returned no data")
+        return data
+
     async def _async_ensure_authenticated(self) -> None:
         if self._access_token and time.monotonic() < self._token_valid_until:
             return
@@ -831,6 +1401,7 @@ class MaikaApiClient:
 
     def _clear_authentication(self) -> None:
         self._access_token = None
+        self._favorite_playlist_id = None
         self._token_valid_until = 0.0
 
     def _rest_headers(self, *, include_authorization: bool) -> dict[str, str]:
@@ -858,15 +1429,17 @@ class MaikaApiClient:
             "language-code": APP_LANGUAGE,
         }
 
-    def _stream_headers(self, encoded_meta: str) -> dict[str, str]:
+    def _stream_headers(
+        self, encoded_meta: str, *, device_id: str | None = None
+    ) -> dict[str, str]:
         assert self._access_token is not None
         assert self._user_id is not None
         return {
             "Authorization": self._access_token,
-            "device-id": self._client_id,
+            "device-id": device_id or self._client_id,
             "device-type": APP_DEVICE_TYPE,
             "version-info": APP_VERSION,
-            "olli-session-id": self._session_id,
+            "olli-session-id": device_id or self._session_id,
             "source": APP_DEVICE_TYPE,
             "Content-Type": "application/octet-stream",
             "client-version": APP_VERSION,
@@ -933,18 +1506,21 @@ class MaikaApiClient:
             and str(header.get("namespace", "")).casefold() == "clientinformation"
         ):
             device_payload = self._extract_device_payload(payload)
-            normalized = self._normalize_device_record(
-                device_payload, assume_online=True
-            )
+            normalized = self._normalize_device_record(device_payload)
             if normalized is not None:
                 serial_number = normalized["device_id"]
                 current_live = self.live_device_info.get(serial_number, {})
-                merged_live = {**current_live, **normalized}
+                merged_live = {**current_live, **deepcopy(normalized)}
+                if "current_playback" in normalized:
+                    merged_live["current_playback"] = merge_current_playback(
+                        current_live.get("current_playback"),
+                        normalized["current_playback"],
+                    )
                 self.live_device_info[serial_number] = merged_live
                 self._cache_discovered_device(normalized)
                 for future in self._device_info_waiters.pop(serial_number, []):
                     if not future.done():
-                        future.set_result(merged_live)
+                        future.set_result(deepcopy(normalized))
                 discovered = self._discovered_devices[serial_number]
                 if self._has_usable_internal_id(discovered):
                     waiters = self._device_discovery_waiters

@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>MAIKA panel verification</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; font-family: system-ui; }
+    body { display: flex; overflow: hidden; background: #101010; }
+    #sidebar { display: none; flex: none; width: 256px; }
+    #app { flex: 1; min-width: 0; overflow: hidden; }
+    ha-panel-custom { display: block; }
+    maika-panel { flex: 1; min-width: 0; }
+  </style>
+  <script type="module" src="/maika-panel.js"></script>
+</head>
+<body>
+  <aside id="sidebar"></aside>
+  <main id="app">
+    <partial-panel-resolver>
+      <ha-panel-custom><maika-panel id="panel"></maika-panel></ha-panel-custom>
+    </partial-panel-resolver>
+  </main>
+  <script>
+    window.calls = [];
+    window.browseCalls = [];
+    window.failApi = false;
+    window.failSave = false;
+    window.failBrowse = false;
+    window.failSearch = false;
+    window.searchItems = [
+      {media_class: "music", media_content_type: "maika_nct_track", media_content_id: "Track0009", title: "Tìm thấy — Sơn Tùng", can_play: true, can_expand: false},
+    ];
+    window.reminders = [
+      {id: 1, event: "Uống thuốc", start_at: "2030-01-02T08:00:00+07:00", start_date: "2030-01-02", start_time: "08:00:00", frequency: "daily", completed: 0, status: 1, reminder_type: 1, alarm_type: 1, custom_tts: "Uống thuốc", devices: ["SERIAL-0-0"]},
+    ];
+    window.states = {};
+    const browseSong = (suffix) => `maika:${suffix.repeat(64)}:${encodeURIComponent(`bài-${suffix}`)}`;
+    window.browseItems = [
+      {media_class: "track", media_content_type: "maika_song", media_content_id: browseSong("a"), title: "Bài một — Ca sĩ A", can_play: true, can_expand: false},
+      {media_class: "track", media_content_type: "maika_song", media_content_id: browseSong("b"), title: "Bài hai", can_play: true, can_expand: false},
+    ];
+    window.csTree = {
+      maika_cs_root: {title: "Thư viện giải trí", children: [
+        {media_class: "directory", media_content_type: "maika_cs_channels", media_content_id: "maika_cs_channels", title: "Kênh", can_play: false, can_expand: true},
+        {media_class: "directory", media_content_type: "maika_cs_categories", media_content_id: "maika_cs_categories", title: "Thể loại", can_play: false, can_expand: true},
+        {media_class: "directory", media_content_type: "maika_nct_root", media_content_id: "maika_nct_root", title: "NhạcCủaTui", can_play: false, can_expand: true},
+        {media_class: "directory", media_content_type: "maika_favorite", media_content_id: "maika_favorite", title: "Bài hát yêu thích", can_play: false, can_expand: true},
+      ]},
+      maika_favorite: {title: "Bài hát yêu thích", children: [
+        {media_class: "music", media_content_type: "maika_favorite_track", media_content_id: "https://cdn.example.test/yeu-thich.mp3", title: "Yêu thích — Ca sĩ", can_play: true, can_expand: false},
+      ]},
+      maika_nct_root: {title: "NhạcCủaTui", children: [
+        {media_class: "directory", media_content_type: "maika_nct_feed", media_content_id: "maika_nct_feed", title: "Bài hát mới", can_play: false, can_expand: true},
+        {media_class: "directory", media_content_type: "maika_nct_charts", media_content_id: "maika_nct_charts", title: "Top thịnh hành", can_play: false, can_expand: true},
+      ]},
+      maika_nct_feed: {title: "Bài hát mới", children: [
+        {media_class: "music", media_content_type: "maika_nct_track", media_content_id: "Track0001", title: "Bài NCT — Ca sĩ NCT", can_play: true, can_expand: false},
+      ]},
+      maika_nct_charts: {title: "Top thịnh hành", children: [
+        {media_class: "album", media_content_type: "maika_nct_chart:chart-1", media_content_id: "maika_nct_chart:chart-1", title: "Top 50", can_play: false, can_expand: true},
+      ]},
+      "maika_nct_chart:chart-1": {title: "NhạcCủaTui", children: [
+        {media_class: "music", media_content_type: "maika_nct_track", media_content_id: "Track0002", title: "Chart NCT", can_play: true, can_expand: false},
+      ]},
+      maika_cs_channels: {title: "Kênh", children: [
+        {media_class: "channel", media_content_type: "maika_cs_channel:7", media_content_id: "maika_cs_channel:7", title: "Kênh thiếu nhi", can_play: false, can_expand: true},
+      ]},
+      "maika_cs_channel:7": {title: "Kênh thiếu nhi", children: [
+        {media_class: "genre", media_content_type: "maika_cs_channel_category:7:1", media_content_id: "maika_cs_channel_category:7:1", title: "Thiếu nhi", can_play: false, can_expand: true},
+      ]},
+      "maika_cs_channel_category:7:1": {title: "Thiếu nhi", children: [
+        {media_class: "directory", media_content_type: "maika_cs_media:42", media_content_id: "maika_cs_media:42", title: "Album bé", can_play: false, can_expand: true},
+      ]},
+      "maika_cs_media:42": {title: "Album bé", children: [
+        {media_class: "track", media_content_type: "maika_cs_track", media_content_id: "https://cdn.example.test/be.mp3", title: "Bài thiếu nhi", can_play: true, can_expand: false},
+      ]},
+    };
+    const entries = [];
+    const entityData = {
+      binary_sensor: {online: "on", wifi_connected: "on", available_to_call: "on", favorite: "off", device_active: "on", warranty_active: "on"},
+      sensor: {volume: "42", playback_status: "playing", model: "OLLI MAIKA S1", room: "Phòng ngủ", default_language: "vi-VN", wifi_ssid: "MAIKA Home 5G", serial_number: "SN-0001", activated_at: "2024-12-01", firmware_version: "3.2.3", firmware_update_status: "up_to_date", warranty_expire_date: "2027-12-01"},
+      switch: {microphone_mute: "off"},
+      select: {tts_voice: "Nữ miền Bắc", wakeword_sensitivity: "medium", wakeword_response: "Xin chào"},
+      text: {speaker_name: "Loa phòng ngủ", calling_name: "Phòng ngủ", address: "123 Nguyễn Trãi, Hà Nội"},
+      button: {refresh_status: "unknown", restart: "unknown"},
+      media_player: {media: "playing"},
+    };
+    for (let account = 0; account < 2; account += 1) {
+      const entry = {
+        entry_id: `account-${account}`, title: `Nhà ${account + 1}`, devices: {}, entities: {}, device_entities: {}, entity_keys: {},
+        options: {scan_interval: 60, enable_experimental_cloud_cast: true, enable_voice_command_sensor: true, voice_command_rules: '# Cấu hình cũ được giữ nguyên\nbật đèn | light.phong_khach | turn_on | {"rgb_color": [255, 80, 20], "brightness": 128}\nchạy lệnh cũ | automation.di_ngu | trigger\n', voice_success_audio_source: "bundled", voice_success_audio_timing: "priority", voice_success_audio_url: "", voice_success_audio_path: "", voice_success_media_player_entity_id: "", voice_response_tts_entity_id: "", cloud_cast_base_url: ""},
+        command_history: [{text: "từ snapshot", normalized: "từ snapshot", received_at: "2026-10-12T10:00:00+00:00", matched_phrase: "bật đèn phòng khách", target_entity_id: "light.phong_khach", action: "turn_on", service: "light.turn_on", executed: true, entity_state_after: "on"}],
+      };
+      for (let speaker = 0; speaker < 2; speaker += 1) {
+        const serial = `SERIAL-${account}-${speaker}`;
+        const name = speaker ? "Loa phòng khách" : "Loa phòng ngủ";
+        entry.devices[serial] = {name, serial_number: serial, model: "OLLI MAIKA S1", manufacturer: "MAIKA", status: "active"};
+        const groups = entry.device_entities[serial] = {};
+        for (const [domain, entities] of Object.entries(entityData)) {
+          groups[domain] = [];
+          entry.entities[domain] ||= [];
+          let counter = 0;
+          for (const [key, value] of Object.entries(entities)) {
+            const id = `${domain}.arbitrary_${account}_${speaker}_${counter++}`;
+            const attributes = domain === "media_player" ? {volume_level: .42 + speaker * .2, is_volume_muted: false, media_title: "Nhạc nhẹ buổi sáng", media_artist: "Ca sĩ thử nghiệm", media_album_name: "Album thử nghiệm", media_content_id: "https://media.example.test/nhac-nhe.mp3", entity_picture: "https://smarthomekit.vn/wp-content/uploads/2021/12/olli-maika-2.jpg", supported_features: 152127, media_duration: 215, media_position: 42, media_position_updated_at: new Date().toISOString(), maika_song_key: "key-second", maika_queue_item_id: browseSong("b")} : {};
+            if (domain === "select") attributes.options = [value, "Tuỳ chọn khác"];
+            states[id] = {entity_id: id, state: key === "speaker_name" ? name : value, attributes};
+            entry.entity_keys[id] = key;
+            groups[domain].push(id);
+            entry.entities[domain].push(id);
+          }
+        }
+      }
+      entries.push(entry);
+    }
+    window.snapshot = {entries, scan_interval_bounds: [15, 3600], audio_source_options: ["disabled", "bundled", "library", "custom"], audio_timing_options: ["priority", "after_success"], audio_library_path: "maika/panel/audio", audio_library_url_path: "/maika_media"};
+    states["sensor.loa_last_voice_command"] = {entity_id: "sensor.loa_last_voice_command", state: "bật đèn phòng khách", attributes: {friendly_name: "Câu lệnh gần đây", recent_commands: [
+      {text: "bật đèn phòng khách", received_at: "2026-10-12T11:00:00+00:00", matched_phrase: "bật đèn phòng khách", target_entity_id: "light.phong_khach", action: "turn_on", service: "light.turn_on", executed: true},
+      {text: "mở cửa nhà kho", received_at: "2026-10-12T10:55:00+00:00"},
+      {text: "tắt quạt", received_at: "2026-10-12T10:50:00+00:00", matched_phrase: "tắt quạt", target_entity_id: "fan.phong_khach", action: "turn_off", error: "ServiceNotFound"},
+    ]}};
+    entries[0].entities.sensor = [...(entries[0].entities.sensor || []), "sensor.loa_last_voice_command"];
+    for (const serial of Object.keys(entries[0].device_entities)) entries[0].device_entities[serial].sensor = [...(entries[0].device_entities[serial].sensor || []), "sensor.loa_last_voice_command"];
+    const demoEntities = {
+      "light.phong_khach": ["Đèn phòng khách", {supported_color_modes: ["brightness", "rgb"]}],
+      "fan.phong_khach": ["Quạt phòng khách", {preset_modes: ["auto", "sleep"]}],
+      "cover.rem": ["Rèm cửa phòng khách", {}],
+      "climate.may_lanh": ["Điều hòa phòng ngủ", {min_temp: 16, max_temp: 30, hvac_modes: ["off", "cool"], fan_modes: ["auto", "low", "high"]}],
+      "automation.di_ngu": ["Đi ngủ — tắt nhà", {}],
+      "script.chao_mung": ["Chào mừng về nhà", {}],
+      "scene.xem_phim": ["Xem phim", {}],
+      "media_player.tv": ["TV phòng khách", {source_list: ["HDMI 1", "HDMI 2"]}],
+      "input_select.che_do": ["Chế độ nhà", {options: ["Ở nhà", "Đi vắng"]}],
+      "button.chuong": ["Chuông cửa", {}],
+      "lock.cua": ["Khóa cửa chính", {}],
+      "timer.bep": ["Hẹn giờ bếp", {}],
+      "sensor.nhiet_do": ["Nhiệt độ phòng khách", {unit_of_measurement: "°C", device_class: "temperature"}],
+    };
+    for (const [entityId, [name, attributes]] of Object.entries(demoEntities)) states[entityId] = {entity_id: entityId, state: "off", attributes: {friendly_name: name, ...attributes}};
+    states["sensor.nhiet_do"].state = "28.5";
+    states["tts.piper"] = {entity_id: "tts.piper", state: "idle", attributes: {friendly_name: "Piper"}};
+    window.hass = {
+      states, themes: {darkMode: true},
+      callApi: async (method, path, data) => {
+        calls.push({method, path, data});
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        if (failApi) throw new Error("Thử mất kết nối");
+        if (method === "GET" && path === "maika/panel/audio") return {url_path: "/maika_media", files: [{path: "mp3/maika.mp3", name: "maika.mp3", root: "mp3"}, {path: "www/thanh-cong.mp3", name: "thanh-cong.mp3", root: "www"}]};
+        if (method === "GET" && path.startsWith("maika/panel/favorites")) return {song_ids: [...(window.favoriteSongIds || [])]};
+        if (method === "GET" && path.startsWith("maika/panel/reminders")) return {reminders: window.reminders.map((item) => ({...item}))};
+        if (method === "POST" && path === "maika/panel/reminders") {
+          if (data.action === "create") {
+            window.reminders.push({id: window.reminders.length + 1, event: data.event, start_at: data.start_at, frequency: data.frequency, alert_prior: data.alert_prior * 60, alert_prior_minutes: data.alert_prior, completed: 0, status: 1, reminder_type: 1, alarm_type: 1, custom_tts: data.custom_tts || data.event, devices: [data.serial_number]});
+          } else if (data.action === "update") {
+            const item = window.reminders.find((entry) => entry.id === data.reminder_id);
+            if (item) Object.assign(item, {event: data.event, start_at: data.start_at, frequency: data.frequency, alert_prior: data.alert_prior * 60, alert_prior_minutes: data.alert_prior, custom_tts: data.custom_tts || data.event});
+          } else if (data.action === "toggle") {
+            const item = window.reminders.find((entry) => entry.id === data.reminder_id);
+            if (item) item.status = data.enabled ? 1 : 2;
+          } else if (data.action === "mute") {
+            const ids = data.reminder_ids || [];
+            window.reminders = window.reminders.map((item) => ids.includes(item.id) ? {...item, mute_days: [...(item.mute_days || []), ...data.mute_days]} : item);
+          } else if (data.action === "delete") {
+            const ids = data.reminder_ids || [data.reminder_id];
+            window.reminders = window.reminders.filter((item) => !ids.includes(item.id));
+          }
+          return {ok: true, reminders: window.reminders.map((item) => ({...item}))};
+        }
+        if (method === "GET") return structuredClone(snapshot);
+        if (path === "maika/panel/chat") {
+          const entry = snapshot.entries.find((item) => item.entry_id === data.entry_id);
+          entry.chat ||= [];
+          entry.chat.push({role: "user", text: data.text, serial_number: data.serial_number, at: new Date().toISOString()});
+          return {ok: true, chat: entry.chat.slice()};
+        }
+        if (path === "maika/panel/options") {
+          if (failSave) throw new Error("Lưu thất bại giả lập");
+          const entry = snapshot.entries.find((item) => item.entry_id === data.entry_id);
+          if ("expected_voice_rules" in data && data.expected_voice_rules !== entry.options.voice_command_rules || data.expected_voice_options && Object.entries(data.expected_voice_options).some(([key, value]) => entry.options[key] !== value)) throw {body: {message: "voice_rules_changed"}};
+          Object.assign(entry.options, data.options);
+          return {updated: true};
+        }
+        return {status: "active"};
+      },
+      callService: async (domain, service, data) => {calls.push({domain, service, data});},
+      callWS: async (message) => {
+        browseCalls.push(message);
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        if (failBrowse) throw {body: {message: "maika_queue_refresh_failed"}};
+        if (message?.type === "media_player/browse_media") {
+          const node = window.csTree[message.media_content_id];
+          if (node) return {media_class: "directory", media_content_type: message.media_content_id, media_content_id: message.media_content_id, title: node.title, can_expand: true, children: node.children.map((child) => ({...child}))};
+          return {media_class: "playlist", media_content_type: "maika_playlist", media_content_id: "maika_playlist", title: "Danh sách trên loa MAIKA", can_expand: true, children: browseItems.map((item) => ({...item}))};
+        }
+        if (message?.type === "media_player/search_media") {
+          if (window.failSearch) throw {body: {message: "nhaccuatui_failed"}};
+          return {result: window.searchItems.map((item) => ({...item}))};
+        }
+        throw new Error(`Unhandled websocket command: ${message?.type}`);
+      },
+    };
+    window.panel = document.getElementById("panel");
+    Promise.all([customElements.whenDefined("maika-panel"), fetch("/voice-actions.json").then((response) => response.json())]).then(([, catalog]) => {
+      snapshot.voice_actions = catalog;
+      snapshot.voice_limits = {rules: 200, phrase: 200};
+      hass.services = Object.fromEntries(Object.entries(catalog).map(([domain, actions]) => [domain, Object.fromEntries(Object.keys(actions).map((action) => [action, {}]))]));
+      panel.narrow = innerWidth < 870; panel.hass = hass;
+    });
+    window.tick = () => { panel.hass = {...hass, states: {...states}}; };
+  </script>
+</body>
+</html>

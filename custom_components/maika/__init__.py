@@ -5,7 +5,11 @@ from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.typing import ConfigType
 
 from .api import MaikaApiClient
 from .const import (
@@ -16,8 +20,10 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import MaikaDataUpdateCoordinator
+from .panel import async_register_panel, async_remove_panel
 from .phone import normalize_login_identifier
 from .runtime import MaikaRuntimeData
+from .services import async_setup_services
 
 PLATFORMS = [
     Platform.BINARY_SENSOR,
@@ -31,9 +37,28 @@ PLATFORMS = [
 
 type MaikaConfigEntry = ConfigEntry[MaikaRuntimeData]
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+_LEGACY_ENTRY_KEYS = (
+    "activation_code",
+    "installation_hash",
+    "license_expires_at",
+    "license_id",
+    "license_key",
+    "license_server_url",
+    "license_status",
+)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register integration-wide services."""
+    await async_setup_services(hass)
+    return True
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: MaikaConfigEntry) -> bool:
     """Set up MAIKA from a config entry."""
+    await async_register_panel(hass)
     client = MaikaApiClient(
         async_get_clientsession(hass),
         str(entry.data[CONF_PHONE_NUMBER]),
@@ -54,11 +79,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: MaikaConfigEntry) -> boo
         await coordinator.async_config_entry_first_refresh()
         entry.runtime_data = MaikaRuntimeData(client, coordinator)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    except Exception:
+    except BaseException:
+        await coordinator.async_stop()
         await client.async_stop()
         raise
 
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+    entry.async_on_unload(
+        hass.bus.async_listen(
+            er.EVENT_ENTITY_REGISTRY_UPDATED,
+            coordinator.async_handle_entity_registry_updated,
+        )
+    )
     return True
 
 
@@ -66,19 +98,39 @@ async def async_unload_entry(hass: HomeAssistant, entry: MaikaConfigEntry) -> bo
     """Unload a MAIKA config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        await entry.runtime_data.coordinator.async_stop_voice_subscriptions()
+        await entry.runtime_data.coordinator.async_stop()
         await entry.runtime_data.client.async_stop()
     return unload_ok
 
 
+async def async_remove_entry(hass: HomeAssistant, entry: MaikaConfigEntry) -> None:
+    """Remove the management panel only when the final account is deleted."""
+    if not any(
+        other.entry_id != entry.entry_id
+        for other in hass.config_entries.async_entries(DOMAIN)
+    ):
+        await async_remove_panel(hass)
+
+
 async def async_migrate_entry(hass: HomeAssistant, entry: MaikaConfigEntry) -> bool:
-    """Migrate config entries created before activation support."""
+    """Migrate config entries from older releases."""
     if entry.version < 3:
         data = dict(entry.data)
         phone_number = data.get(CONF_PHONE_NUMBER)
         if phone_number is not None:
             data[CONF_PHONE_NUMBER] = normalize_login_identifier(str(phone_number))
         hass.config_entries.async_update_entry(entry, data=data, version=3)
+
+    if entry.version < 4:
+        data = dict(entry.data)
+        options = dict(entry.options)
+        for key in _LEGACY_ENTRY_KEYS:
+            data.pop(key, None)
+            options.pop(key, None)
+        hass.config_entries.async_update_entry(
+            entry, data=data, options=options, version=4
+        )
+        await Store(hass, 1, "maika.license").async_remove()
     return True
 
 

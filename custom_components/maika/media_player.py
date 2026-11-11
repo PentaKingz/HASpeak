@@ -2,59 +2,123 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
+import re
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from homeassistant.components import media_source
 from homeassistant.components.media_player import (
+    BrowseError,
     BrowseMedia,
+    MediaClass,
     MediaPlayerDeviceClass,
     MediaPlayerEnqueue,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
     MediaType,
+    SearchMedia,
+    SearchMediaQuery,
     async_process_play_media_url,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.components.media_player.errors import SearchError
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    HomeAssistantError,
+    ServiceValidationError,
+)
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from . import MaikaConfigEntry
 from .api import MaikaApiError
-from .const import CONF_ENABLE_CLOUD_CAST, DOMAIN
+from .cast_target import cast_ready_url
+from .const import CONF_CLOUD_CAST_BASE_URL, CONF_ENABLE_CLOUD_CAST, DOMAIN
+from .content_store import MaikaContentStore
 from .entity import MaikaCommandEntity
 from .media_url import is_valid_http_media_url
+from .nhaccuatui import MaikaNhacCuaTui, parse_nct_song_key
 
 _BASE_SUPPORTED_FEATURES = (
     MediaPlayerEntityFeature.VOLUME_SET
     | MediaPlayerEntityFeature.VOLUME_MUTE
     | MediaPlayerEntityFeature.PLAY
     | MediaPlayerEntityFeature.PAUSE
+    | MediaPlayerEntityFeature.STOP
     | MediaPlayerEntityFeature.NEXT_TRACK
     | MediaPlayerEntityFeature.PREVIOUS_TRACK
+    | MediaPlayerEntityFeature.PLAY_MEDIA
+    | MediaPlayerEntityFeature.BROWSE_MEDIA
+    | MediaPlayerEntityFeature.SEARCH_MEDIA
 )
-_CLOUD_CAST_SUPPORTED_FEATURES = (
-    MediaPlayerEntityFeature.PLAY_MEDIA | MediaPlayerEntityFeature.BROWSE_MEDIA
-)
+_CLOUD_CAST_SUPPORTED_FEATURES = MediaPlayerEntityFeature.SEEK
 _CLOUD_CAST_STREAM_FORMATS = {
+    "application/ogg": "AUDIO_MPEG",
+    "application/octet-stream": "AUDIO_MPEG",
     "audio": "AUDIO_MPEG",
     "audio/aac": "AUDIO_MPEG",
+    "audio/aacp": "AUDIO_MPEG",
+    "audio/flac": "AUDIO_MPEG",
     "audio/m4a": "AUDIO_MPEG",
     "audio/mp3": "AUDIO_MPEG",
     "audio/mp4": "AUDIO_MPEG",
     "audio/mp4a-latm": "AUDIO_MPEG",
     "audio/mpeg": "AUDIO_MPEG",
+    "audio/mpegurl": "AUDIO_MPEG",
+    "audio/ogg": "AUDIO_MPEG",
+    "audio/opus": "AUDIO_MPEG",
+    "audio/vnd.wave": "AUDIO_MPEG",
+    "audio/wav": "AUDIO_MPEG",
+    "audio/wave": "AUDIO_MPEG",
+    "audio/webm": "AUDIO_MPEG",
     "audio/x-aac": "AUDIO_MPEG",
+    "audio/x-flac": "AUDIO_MPEG",
     "audio/x-m4a": "AUDIO_MPEG",
     "audio/x-mpeg": "AUDIO_MPEG",
+    "audio/x-mpegurl": "AUDIO_MPEG",
+    "audio/x-wav": "AUDIO_MPEG",
     "music": "AUDIO_MPEG",
     "url": "AUDIO_MPEG",
 }
 _DEFAULT_UNMUTE_VOLUME = 0.3
+_MEDIA_ROOT = "maika_root"
+_MEDIA_PLAYLIST = "maika_playlist"
+_MEDIA_SONG = "maika_song"
+_MEDIA_CS_ROOT = "maika_cs_root"
+_MEDIA_CS_CHANNELS = "maika_cs_channels"
+_MEDIA_CS_CATEGORIES = "maika_cs_categories"
+_MEDIA_CS_HIGHLIGHTS = "maika_cs_highlights"
+_MEDIA_CS_CHANNEL_PREFIX = "maika_cs_channel:"
+_MEDIA_CS_CHANNEL_CATEGORY_PREFIX = "maika_cs_channel_category:"
+_MEDIA_CS_CATEGORY_PREFIX = "maika_cs_category:"
+_MEDIA_CS_MEDIA_PREFIX = "maika_cs_media:"
+_MEDIA_CS_TRACK = "maika_cs_track"
+_MEDIA_NCT_ROOT = "maika_nct_root"
+_MEDIA_NCT_FEED = "maika_nct_feed"
+_MEDIA_NCT_CHARTS = "maika_nct_charts"
+_MEDIA_NCT_CHART_PREFIX = "maika_nct_chart:"
+_MEDIA_NCT_TRACK = "maika_nct_track"
+_MEDIA_FAVORITE = "maika_favorite"
+_MEDIA_FAVORITE_TRACK = "maika_favorite_track"
+_CS_ROOT_TITLE = "Thư viện giải trí MAIKA"
+_CS_CHANNELS_TITLE = "Kênh"
+_CS_CATEGORIES_TITLE = "Thể loại"
+_CS_HIGHLIGHTS_TITLE = "Nổi bật"
+_NCT_ROOT_TITLE = "NhạcCủaTui"
+_NCT_FEED_TITLE = "Bài hát mới"
+_NCT_CHARTS_TITLE = "Top thịnh hành"
+_NCT_CHART_TITLE = "NhạcCủaTui"
+_FAVORITE_TITLE = "Bài hát yêu thích"
+_QUEUE_TITLE = "Danh sách trên loa MAIKA"
+_MAX_SONG_KEY_BYTES = 512
+_MAX_QUEUE_ITEM_ID_LENGTH = 71 + _MAX_SONG_KEY_BYTES * 3
+_QUEUE_ITEM_ID_PATTERN = re.compile(r"maika:([0-9a-f]{64}):([A-Za-z0-9_.~%\-]+)")
 
 
 async def async_setup_entry(
@@ -81,13 +145,46 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
     def __init__(self, coordinator, serial_number) -> None:
         super().__init__(coordinator, serial_number, "media_player")
         self._position_updated_at: datetime | None = None
+        self._reported_playback: tuple[Any, ...] | None = None
         self._volume_before_mute: float | None = None
+        self._last_cast_media: dict[str, Any] | None = None
+        self._content_store = MaikaContentStore(coordinator.client)
+        self._nct = MaikaNhacCuaTui(coordinator.client)
         self._cloud_cast_enabled = bool(
             coordinator.entry.options.get(CONF_ENABLE_CLOUD_CAST, False)
         )
         self._attr_supported_features = _BASE_SUPPORTED_FEATURES
         if self._cloud_cast_enabled:
             self._attr_supported_features |= _CLOUD_CAST_SUPPORTED_FEATURES
+        self._update_position_timestamp()
+
+    @property
+    def _cast_base_url(self) -> str:
+        """Return the user pinned base URL for speaker media downloads."""
+        return str(
+            self.coordinator.entry.options.get(CONF_CLOUD_CAST_BASE_URL, "") or ""
+        )
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Keep the timestamp tied to the reported playback, not volume updates."""
+        self._update_position_timestamp()
+        super()._handle_coordinator_update()
+
+    @callback
+    def _update_position_timestamp(self) -> None:
+        """Refresh the time anchor when position, state or track changes."""
+        playback = (
+            self.state,
+            self.media_position,
+            self.media_content_id,
+            self.media_title,
+        )
+        if playback != self._reported_playback:
+            self._reported_playback = playback
+            self._position_updated_at = (
+                datetime.now(dt_util.UTC) if self.media_position is not None else None
+            )
 
     @property
     def state(self) -> MediaPlayerState:
@@ -124,17 +221,44 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
             attributes.get("url"),
             attributes.get("mediaId"),
             attributes.get("media_id"),
-            attributes.get("songKey"),
             attributes.get("key"),
+            attributes.get("songKey"),
+            attributes.get("id"),
         )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attributes = self._playback_attributes
+        key = next(
+            (
+                key
+                for field in ("key", "songKey", "id")
+                if (key := self._valid_song_key(attributes.get(field))) is not None
+            ),
+            None,
+        )
+        favorite_id = self._favorite_song_id()
+        result: dict[str, str] = {}
+        if key is not None:
+            result["maika_song_key"] = key
+        if favorite_id is not None and favorite_id != key:
+            result["maika_favorite_song_id"] = favorite_id
+        if not result:
+            return result
+        playlist, songs = self._native_playlist()
+        if key is not None and any(song.get("songKey") == key for song in songs):
+            result["maika_queue_item_id"] = self._queue_item_id(
+                self._queue_revision(playlist), key
+            )
+        return result
 
     @property
     def media_title(self) -> str | None:
         """Return current media title."""
         attributes = self._playback_attributes
         return self._first_string(
-            attributes.get("title"),
             attributes.get("song"),
+            attributes.get("title"),
             attributes.get("name"),
         )
 
@@ -193,18 +317,47 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
             return None
         value = payload.get("offsetInMilliseconds")
         try:
-            return float(value) / 1000.0 if value is not None else None
+            seconds = float(value) / 1000.0
         except (TypeError, ValueError):
             return None
+        return max(0.0, seconds) if math.isfinite(seconds) else None
 
     @property
     def media_position_updated_at(self) -> datetime | None:
         """Return the timestamp associated with playback position."""
         if self.media_position is None:
             return None
-        if self._position_updated_at is None:
-            self._position_updated_at = datetime.now(dt_util.UTC)
         return self._position_updated_at
+
+    @property
+    def media_duration(self) -> float | None:
+        """Return total track length in seconds from playback or queue metadata."""
+        payload = self._current_playback.get("payload")
+        if isinstance(payload, dict):
+            for field in ("durationInMilliseconds", "durationInMillis"):
+                if (
+                    seconds := self._duration_seconds(
+                        payload.get(field), milliseconds=True
+                    )
+                ) is not None:
+                    return seconds
+        attributes = self._playback_attributes
+        for field in ("durationInMilliseconds", "durationInMillis"):
+            if (
+                seconds := self._duration_seconds(
+                    attributes.get(field), milliseconds=True
+                )
+            ) is not None:
+                return seconds
+        for field in ("duration", "time"):
+            if (seconds := self._duration_seconds(attributes.get(field))) is not None:
+                return seconds
+        song = self._current_native_song()
+        if song is not None:
+            for field in ("time", "duration"):
+                if (seconds := self._duration_seconds(song.get(field))) is not None:
+                    return seconds
+        return None
 
     async def async_set_volume_level(self, volume: float) -> None:
         """Set speaker playback volume."""
@@ -216,7 +369,7 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
         self.coordinator.async_update_device_data(
             self.serial_number, {"volume": target}
         )
-        await self.coordinator.async_refresh_live(self.serial_number)
+        self._schedule_live_refresh()
 
     async def async_mute_volume(self, mute: bool) -> None:
         """Mute or restore speaker output using its volume control."""
@@ -237,12 +390,717 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
         media_content_type: MediaType | str | None = None,
         media_content_id: str | None = None,
     ) -> BrowseMedia:
-        """Browse audio exposed by Home Assistant media sources."""
+        if (
+            media_content_type == _MEDIA_PLAYLIST
+            and media_content_id == _MEDIA_PLAYLIST
+        ):
+            return await self._async_browse_playlist()
+        if media_content_id == _MEDIA_FAVORITE:
+            return await self._async_browse_favorites()
+        if media_content_id and media_content_id.startswith(
+            ("maika_cs_", "maika_nct_")
+        ):
+            return await self._async_browse_content_store(media_content_id)
+        if media_content_id and media_source.is_media_source_id(media_content_id):
+            return await self._async_browse_sources(media_content_id)
+        if (not media_content_type and not media_content_id) or (
+            media_content_type == _MEDIA_ROOT and media_content_id == _MEDIA_ROOT
+        ):
+            children = [await self._async_browse_playlist()]
+            if self._cloud_cast_enabled:
+                children.append(await self._async_browse_sources(None))
+            children.append(await self._async_browse_nct_root())
+            children.append(await self._content_store_root())
+            return BrowseMedia(
+                media_class=MediaClass.DIRECTORY,
+                media_content_type=_MEDIA_ROOT,
+                media_content_id=_MEDIA_ROOT,
+                title="MAIKA",
+                can_play=False,
+                can_expand=True,
+                children=children,
+            )
+        raise BrowseError(
+            translation_domain=DOMAIN,
+            translation_key="maika_queue_invalid_selection",
+        )
+
+    async def _content_store_root(self) -> BrowseMedia:
+        children = []
+        if await self._resolve_favorite_playlist_id():
+            children.append(
+                BrowseMedia(
+                    media_class=MediaClass.DIRECTORY,
+                    media_content_type=_MEDIA_FAVORITE,
+                    media_content_id=_MEDIA_FAVORITE,
+                    title=_FAVORITE_TITLE,
+                    can_play=False,
+                    can_expand=True,
+                    children_media_class=MediaClass.TRACK,
+                )
+            )
+        children.extend(
+            [
+                self._cs_directory(_MEDIA_CS_CHANNELS, _CS_CHANNELS_TITLE),
+                self._cs_directory(_MEDIA_CS_CATEGORIES, _CS_CATEGORIES_TITLE),
+                self._cs_directory(_MEDIA_CS_HIGHLIGHTS, _CS_HIGHLIGHTS_TITLE),
+                self._cs_directory(_MEDIA_NCT_ROOT, _NCT_ROOT_TITLE),
+            ]
+        )
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=_MEDIA_CS_ROOT,
+            media_content_id=_MEDIA_CS_ROOT,
+            title=_CS_ROOT_TITLE,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.DIRECTORY,
+            children=children,
+        )
+
+    @staticmethod
+    def _cs_directory(media_id: str, title: str) -> BrowseMedia:
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=media_id,
+            media_content_id=media_id,
+            title=title,
+            can_play=False,
+            can_expand=True,
+        )
+
+    async def _async_browse_content_store(self, media_content_id: str) -> BrowseMedia:
+        if not self.available:
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_unavailable",
+            )
+        try:
+            if media_content_id == _MEDIA_CS_ROOT:
+                return await self._content_store_root()
+            if media_content_id == _MEDIA_CS_CHANNELS:
+                return await self._async_browse_cs_channels()
+            if media_content_id == _MEDIA_CS_CATEGORIES:
+                return await self._async_browse_cs_categories()
+            if media_content_id == _MEDIA_CS_HIGHLIGHTS:
+                return await self._async_browse_cs_highlights(
+                    None, _CS_HIGHLIGHTS_TITLE
+                )
+            if media_content_id == _MEDIA_NCT_ROOT:
+                return await self._async_browse_nct_root()
+            if media_content_id == _MEDIA_NCT_FEED:
+                return await self._async_browse_nct_feed()
+            if media_content_id == _MEDIA_NCT_CHARTS:
+                return await self._async_browse_nct_charts()
+            if media_content_id.startswith(_MEDIA_NCT_CHART_PREFIX):
+                chart_key = media_content_id[len(_MEDIA_NCT_CHART_PREFIX) :]
+                return await self._async_browse_nct_chart(chart_key)
+            if media_content_id.startswith(_MEDIA_CS_CHANNEL_CATEGORY_PREFIX):
+                channel_id, category_id = self._cs_pair(
+                    media_content_id, _MEDIA_CS_CHANNEL_CATEGORY_PREFIX
+                )
+                return await self._async_browse_cs_channel_category(
+                    channel_id, category_id
+                )
+            if media_content_id.startswith(_MEDIA_CS_CHANNEL_PREFIX):
+                channel_id = self._cs_int(media_content_id, _MEDIA_CS_CHANNEL_PREFIX)
+                return await self._async_browse_cs_channel_categories(
+                    channel_id, _CS_CHANNELS_TITLE
+                )
+            if media_content_id.startswith(_MEDIA_CS_CATEGORY_PREFIX):
+                value = media_content_id[len(_MEDIA_CS_CATEGORY_PREFIX) :]
+                return await self._async_browse_cs_highlights(value, value)
+            if media_content_id.startswith(_MEDIA_CS_MEDIA_PREFIX):
+                media_id = self._cs_int(media_content_id, _MEDIA_CS_MEDIA_PREFIX)
+                return await self._async_browse_cs_episodes(media_id)
+        except MaikaApiError as err:
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="maika_content_store_failed",
+            ) from err
+        raise BrowseError(
+            translation_domain=DOMAIN,
+            translation_key="maika_content_store_invalid_selection",
+        )
+
+    @staticmethod
+    def _cs_int(media_id: str, prefix: str) -> int:
+        raw = media_id[len(prefix) :]
+        if not raw.lstrip("-").isdigit():
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="maika_content_store_invalid_selection",
+            )
+        return int(raw)
+
+    @staticmethod
+    def _cs_pair(media_id: str, prefix: str) -> tuple[int, int]:
+        raw = media_id[len(prefix) :]
+        channel, separator, category = raw.partition(":")
+        if (
+            not separator
+            or not channel.lstrip("-").isdigit()
+            or not category.lstrip("-").isdigit()
+        ):
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="maika_content_store_invalid_selection",
+            )
+        return int(channel), int(category)
+
+    @staticmethod
+    def _cs_cover(cover: str | None) -> str | None:
+        return cover if cover and is_valid_http_media_url(cover) else None
+
+    async def _async_browse_cs_channels(self) -> BrowseMedia:
+        channels = await self._content_store.async_channels()
+        children = [
+            BrowseMedia(
+                media_class=MediaClass.CHANNEL,
+                media_content_type=f"{_MEDIA_CS_CHANNEL_PREFIX}{channel['id']}",
+                media_content_id=f"{_MEDIA_CS_CHANNEL_PREFIX}{channel['id']}",
+                title=channel["name"],
+                can_play=False,
+                can_expand=True,
+                thumbnail=self._cs_cover(channel.get("cover")),
+            )
+            for channel in channels
+        ]
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=_MEDIA_CS_CHANNELS,
+            media_content_id=_MEDIA_CS_CHANNELS,
+            title=_CS_CHANNELS_TITLE,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.CHANNEL,
+            children=children,
+        )
+
+    async def _async_browse_cs_categories(self) -> BrowseMedia:
+        categories = await self._content_store.async_categories()
+        children = [
+            BrowseMedia(
+                media_class=MediaClass.GENRE,
+                media_content_type=f"{_MEDIA_CS_CATEGORY_PREFIX}{category['value']}",
+                media_content_id=f"{_MEDIA_CS_CATEGORY_PREFIX}{category['value']}",
+                title=category["title"],
+                can_play=False,
+                can_expand=True,
+            )
+            for category in categories
+        ]
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=_MEDIA_CS_CATEGORIES,
+            media_content_id=_MEDIA_CS_CATEGORIES,
+            title=_CS_CATEGORIES_TITLE,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.GENRE,
+            children=children,
+        )
+
+    async def _async_browse_cs_highlights(
+        self, category: str | None, title: str
+    ) -> BrowseMedia:
+        medias = await self._content_store.async_highlights(category)
+        media_content_type = (
+            f"{_MEDIA_CS_CATEGORY_PREFIX}{category}"
+            if category
+            else _MEDIA_CS_HIGHLIGHTS
+        )
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=media_content_type,
+            media_content_id=media_content_type,
+            title=title,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.ALBUM,
+            children=[self._cs_media_node(media) for media in medias],
+        )
+
+    async def _async_browse_cs_channel_categories(
+        self, channel_id: int, title: str
+    ) -> BrowseMedia:
+        categories = await self._content_store.async_channel_categories(channel_id)
+        children = [
+            BrowseMedia(
+                media_class=MediaClass.GENRE,
+                media_content_type=(
+                    f"{_MEDIA_CS_CHANNEL_CATEGORY_PREFIX}{channel_id}:{category['id']}"
+                ),
+                media_content_id=(
+                    f"{_MEDIA_CS_CHANNEL_CATEGORY_PREFIX}{channel_id}:{category['id']}"
+                ),
+                title=category["title"],
+                can_play=False,
+                can_expand=True,
+                thumbnail=self._cs_cover(category.get("cover")),
+            )
+            for category in categories
+        ]
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=f"{_MEDIA_CS_CHANNEL_PREFIX}{channel_id}",
+            media_content_id=f"{_MEDIA_CS_CHANNEL_PREFIX}{channel_id}",
+            title=title,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.GENRE,
+            children=children,
+        )
+
+    async def _async_browse_cs_channel_category(
+        self, channel_id: int, category_id: int
+    ) -> BrowseMedia:
+        categories = await self._content_store.async_channel_categories(channel_id)
+        category = next(
+            (item for item in categories if item["id"] == category_id), None
+        )
+        if category is None:
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="maika_content_store_invalid_selection",
+            )
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=(
+                f"{_MEDIA_CS_CHANNEL_CATEGORY_PREFIX}{channel_id}:{category_id}"
+            ),
+            media_content_id=(
+                f"{_MEDIA_CS_CHANNEL_CATEGORY_PREFIX}{channel_id}:{category_id}"
+            ),
+            title=category["title"],
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.ALBUM,
+            children=[self._cs_media_node(media) for media in category["medias"]],
+        )
+
+    def _cs_media_node(self, media: dict[str, Any]) -> BrowseMedia:
+        audio = media.get("audio")
+        if audio and not media.get("is_list") and is_valid_http_media_url(audio):
+            return self._cs_track(audio, media.get("title"), media.get("cover"))
+        return BrowseMedia(
+            media_class=MediaClass.ALBUM,
+            media_content_type=f"{_MEDIA_CS_MEDIA_PREFIX}{media['id']}",
+            media_content_id=f"{_MEDIA_CS_MEDIA_PREFIX}{media['id']}",
+            title=media.get("title") or f"MAIKA {media['id']}",
+            can_play=False,
+            can_expand=True,
+            thumbnail=self._cs_cover(media.get("cover")),
+        )
+
+    async def _async_browse_cs_episodes(self, media_id: int) -> BrowseMedia:
+        episodes = await self._content_store.async_episodes(media_id)
+        children = [
+            self._cs_track(episode["audio"], episode.get("title"), episode.get("cover"))
+            for episode in episodes
+        ]
+        return BrowseMedia(
+            media_class=MediaClass.ALBUM,
+            media_content_type=f"{_MEDIA_CS_MEDIA_PREFIX}{media_id}",
+            media_content_id=f"{_MEDIA_CS_MEDIA_PREFIX}{media_id}",
+            title=f"MAIKA {media_id}",
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.MUSIC,
+            children=children,
+        )
+
+    @staticmethod
+    def _cs_track(audio: str, title: str | None, cover: str | None) -> BrowseMedia:
+        return BrowseMedia(
+            media_class=MediaClass.MUSIC,
+            media_content_type=_MEDIA_CS_TRACK,
+            media_content_id=audio,
+            title=title or "MAIKA",
+            can_play=True,
+            can_expand=False,
+            thumbnail=cover if cover and is_valid_http_media_url(cover) else None,
+        )
+
+    async def async_search_media(self, query: SearchMediaQuery) -> SearchMedia:
+        """Search NhacCuaTui songs."""
+        keyword = str(query.search_query or "").strip()
+        if not keyword:
+            return SearchMedia(result=[])
+        try:
+            tracks = await self._nct.async_search(keyword)
+        except (MaikaApiError, ConfigEntryAuthFailed) as err:
+            raise SearchError(
+                translation_domain=DOMAIN,
+                translation_key="nhaccuatui_failed",
+            ) from err
+        return SearchMedia(result=[self._nct_track_node(track) for track in tracks])
+
+    async def _async_browse_nct_root(self) -> BrowseMedia:
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=_MEDIA_NCT_ROOT,
+            media_content_id=_MEDIA_NCT_ROOT,
+            title=_NCT_ROOT_TITLE,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.DIRECTORY,
+            children=[
+                self._cs_directory(_MEDIA_NCT_FEED, _NCT_FEED_TITLE),
+                self._cs_directory(_MEDIA_NCT_CHARTS, _NCT_CHARTS_TITLE),
+            ],
+        )
+
+    async def _async_browse_nct_feed(self) -> BrowseMedia:
+        tracks = await self._nct.async_feed()
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=_MEDIA_NCT_FEED,
+            media_content_id=_MEDIA_NCT_FEED,
+            title=_NCT_FEED_TITLE,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.MUSIC,
+            children=[self._nct_track_node(track) for track in tracks],
+        )
+
+    async def _async_browse_nct_charts(self) -> BrowseMedia:
+        charts = await self._nct.async_charts()
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=_MEDIA_NCT_CHARTS,
+            media_content_id=_MEDIA_NCT_CHARTS,
+            title=_NCT_CHARTS_TITLE,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.ALBUM,
+            children=[
+                BrowseMedia(
+                    media_class=MediaClass.ALBUM,
+                    media_content_type=f"{_MEDIA_NCT_CHART_PREFIX}{chart['key']}",
+                    media_content_id=f"{_MEDIA_NCT_CHART_PREFIX}{chart['key']}",
+                    title=chart["title"],
+                    can_play=False,
+                    can_expand=True,
+                    thumbnail=self._cs_cover(chart.get("cover")),
+                )
+                for chart in charts
+            ],
+        )
+
+    async def _async_browse_nct_chart(self, chart_key: str) -> BrowseMedia:
+        tracks = await self._nct.async_chart_tracks(chart_key)
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=f"{_MEDIA_NCT_CHART_PREFIX}{chart_key}",
+            media_content_id=f"{_MEDIA_NCT_CHART_PREFIX}{chart_key}",
+            title=_NCT_CHART_TITLE,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.MUSIC,
+            children=[self._nct_track_node(track) for track in tracks],
+        )
+
+    @staticmethod
+    def _nct_track_node(track: dict[str, Any]) -> BrowseMedia:
+        title = track.get("title") or "NhacCuaTui"
+        artist = track.get("artist")
+        return BrowseMedia(
+            media_class=MediaClass.MUSIC,
+            media_content_type=_MEDIA_NCT_TRACK,
+            media_content_id=track["key"],
+            title=f"{title} — {artist}" if artist else title,
+            can_play=True,
+            can_expand=False,
+            thumbnail=track.get("cover")
+            if is_valid_http_media_url(track.get("cover"))
+            else None,
+        )
+
+    async def _resolve_favorite_playlist_id(
+        self, *, force: bool = False
+    ) -> int | str | None:
+        if not force:
+            cached = getattr(self.coordinator.client, "favorite_playlist_id", None)
+            if cached:
+                return cached
+        resolver = getattr(
+            self.coordinator.client, "async_resolve_favorite_playlist_id", None
+        )
+        if resolver is None:
+            return None
+        return await resolver(force=force)
+
+    async def _async_browse_favorites(self) -> BrowseMedia:
+        try:
+            playlist_id = await self._resolve_favorite_playlist_id()
+            if not playlist_id:
+                raise BrowseError(
+                    translation_domain=DOMAIN,
+                    translation_key="maika_favorites_unavailable",
+                )
+            songs = await self.coordinator.client.async_list_all_playlist_songs(
+                playlist_id
+            )
+            if not songs:
+                fallback_id = await self._resolve_favorite_playlist_id(force=True)
+                if fallback_id and fallback_id != playlist_id:
+                    songs = await self.coordinator.client.async_list_all_playlist_songs(
+                        fallback_id
+                    )
+        except BrowseError:
+            raise
+        except MaikaApiError as err:
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="maika_favorites_failed",
+            ) from err
+        children = []
+        for song in songs:
+            url = self._first_string(song.get("url"))
+            if not url or not is_valid_http_media_url(url):
+                continue
+            title = (
+                self._first_string(song.get("song"))
+                or self._first_string(song.get("songKey"))
+                or "Bài hát yêu thích"
+            )
+            artist = self._first_string(song.get("artist"))
+            thumbnail = self._first_string(song.get("imageURL"))
+            children.append(
+                BrowseMedia(
+                    media_class=MediaClass.MUSIC,
+                    media_content_type=_MEDIA_FAVORITE_TRACK,
+                    media_content_id=url,
+                    title=f"{title} — {artist}" if artist else title,
+                    can_play=True,
+                    can_expand=False,
+                    thumbnail=thumbnail
+                    if thumbnail and is_valid_http_media_url(thumbnail)
+                    else None,
+                )
+            )
+        return BrowseMedia(
+            media_class=MediaClass.DIRECTORY,
+            media_content_type=_MEDIA_FAVORITE,
+            media_content_id=_MEDIA_FAVORITE,
+            title=_FAVORITE_TITLE,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.MUSIC,
+            children=children,
+        )
+
+    async def _async_browse_sources(self, media_content_id: str | None) -> BrowseMedia:
         return await media_source.async_browse_media(
             self.hass,
             media_content_id,
             content_filter=lambda item: item.media_content_type.startswith("audio/"),
         )
+
+    async def _async_browse_playlist(self) -> BrowseMedia:
+        if not self.available:
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_unavailable",
+            )
+        try:
+            refreshed = await self.coordinator.async_refresh_live(
+                self.serial_number, required_fields=("latest_playlist",)
+            )
+        except (MaikaApiError, ConfigEntryAuthFailed) as err:
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_refresh_failed",
+            ) from err
+        if refreshed is False:
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_refresh_failed",
+            )
+        if not self.available:
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_unavailable",
+            )
+        playlist, songs = self._native_playlist()
+        revision = self._queue_revision(playlist)
+        children = []
+        for song in songs:
+            key = self._valid_song_key(song.get("songKey"))
+            title = self._first_string(song.get("song")) or "Bài hát MAIKA"
+            artist = self._first_string(song.get("artist"))
+            children.append(
+                BrowseMedia(
+                    media_class=MediaClass.TRACK,
+                    media_content_type=_MEDIA_SONG,
+                    media_content_id=self._queue_item_id(revision, key) if key else "",
+                    title=f"{title} — {artist}" if artist else title,
+                    can_play=key is not None,
+                    can_expand=False,
+                )
+            )
+        return BrowseMedia(
+            media_class=MediaClass.PLAYLIST,
+            media_content_type=_MEDIA_PLAYLIST,
+            media_content_id=_MEDIA_PLAYLIST,
+            title=self._first_string(playlist.get("title")) or _QUEUE_TITLE,
+            can_play=False,
+            can_expand=True,
+            children_media_class=MediaClass.TRACK,
+            children=children,
+        )
+
+    def _native_playlist(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        playlist = self.device.get("latest_playlist")
+        if not isinstance(playlist, dict):
+            return {}, []
+        songs = playlist.get("songs")
+        return playlist, (
+            [song for song in songs if isinstance(song, dict)]
+            if isinstance(songs, list)
+            else []
+        )
+
+    @staticmethod
+    def _song_label(*values: Any) -> str | None:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip().casefold()
+        return None
+
+    def _current_native_song(self) -> dict[str, Any] | None:
+        """Return the best queue entry matching the current playback."""
+        playlist, songs = self._native_playlist()
+        if not songs:
+            return None
+        for field in ("item", "itemKey", "current", "currentSong", "current_song"):
+            key = self._valid_song_key(playlist.get(field))
+            if key is None:
+                continue
+            for song in songs:
+                if self._valid_song_key(song.get("songKey")) == key:
+                    return song
+        attributes = self._playback_attributes
+        title = self._song_label(
+            attributes.get("song"),
+            attributes.get("title"),
+            attributes.get("name"),
+        )
+        if title is not None:
+            matches = [
+                song
+                for song in songs
+                if self._song_label(
+                    song.get("song"), song.get("title"), song.get("name")
+                )
+                == title
+            ]
+            artist = self._song_label(
+                attributes.get("artist"), attributes.get("singer")
+            )
+            if len(matches) > 1 and artist is not None:
+                matches = [
+                    song
+                    for song in matches
+                    if self._song_label(song.get("artist"), song.get("singer"))
+                    == artist
+                ]
+            if len(matches) == 1:
+                return matches[0]
+        return songs[0] if len(songs) == 1 else None
+
+    def _queue_revision(self, playlist: dict[str, Any]) -> str:
+        songs = playlist.get("songs")
+        keys = (
+            [
+                song.get("songKey")
+                if isinstance(song, dict) and isinstance(song.get("songKey"), str)
+                else None
+                for song in songs
+            ]
+            if isinstance(songs, list)
+            else []
+        )
+        identity = [
+            self.serial_number,
+            playlist.get("listKey"),
+            playlist.get("source"),
+            keys,
+        ]
+        return hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _valid_song_key(value: Any) -> str | None:
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value) > _MAX_SONG_KEY_BYTES
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)
+        ):
+            return None
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+        return value if len(encoded) <= _MAX_SONG_KEY_BYTES else None
+
+    def _favorite_song_id(self) -> str | None:
+        """Return the best MAIKA song identifier used by the favorite API."""
+        attributes = self._playback_attributes
+        for source in (attributes, self._current_native_song() or {}):
+            for field in ("key", "songKey", "mediaId", "media_id", "id"):
+                value = source.get(field)
+                if isinstance(value, bool) or value is None:
+                    continue
+                text = str(value).strip()
+                if not text or len(text) > _MAX_SONG_KEY_BYTES:
+                    continue
+                if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in text):
+                    continue
+                return text
+        return None
+
+    @staticmethod
+    def _duration_seconds(value: Any, *, milliseconds: bool = False) -> float | None:
+        """Convert MAIKA duration formats to seconds."""
+        if isinstance(value, bool) or value is None:
+            return None
+        seconds: float
+        if isinstance(value, (int, float)):
+            seconds = float(value)
+            if milliseconds or seconds > 10_000:
+                seconds /= 1000.0
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if ":" in text:
+                parts = text.split(":")
+                if len(parts) > 3:
+                    return None
+                try:
+                    seconds = 0.0
+                    for part in parts:
+                        seconds = seconds * 60 + float(part)
+                except ValueError:
+                    return None
+            else:
+                try:
+                    seconds = float(text)
+                except ValueError:
+                    return None
+                if milliseconds or seconds > 10_000:
+                    seconds /= 1000.0
+        else:
+            return None
+        return seconds if math.isfinite(seconds) and seconds > 0 else None
+
+    @staticmethod
+    def _queue_item_id(revision: str, key: str) -> str:
+        return f"maika:{revision}:{quote(key, safe='')}"
 
     async def async_media_play(self) -> None:
         """Resume playback."""
@@ -252,13 +1110,90 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
         """Pause playback."""
         await self._async_playback_command("PauseCommandIssued", "paused")
 
+    async def async_media_stop(self) -> None:
+        """Stop sound via pause without pretending the firmware reset playback."""
+        await self.async_media_pause()
+
     async def async_media_next_track(self) -> None:
         """Skip to the next item."""
+        song = self._adjacent_native_song(1)
         await self._async_playback_command("NextCommandIssued", None)
+        if song is not None:
+            self._apply_optimistic_track(song)
 
     async def async_media_previous_track(self) -> None:
         """Return to the previous item."""
+        song = self._adjacent_native_song(-1)
         await self._async_playback_command("PreviousCommandIssued", None)
+        if song is not None:
+            self._apply_optimistic_track(song)
+
+    async def async_media_seek(self, position: float) -> None:
+        """Restart the current cloud cast at a new offset to seek."""
+        if not self._cloud_cast_enabled:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_cast_disabled",
+            )
+
+        try:
+            target = float(position)
+        except (TypeError, ValueError) as err:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_cast_invalid_seek_position",
+            ) from err
+        if not math.isfinite(target):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_cast_invalid_seek_position",
+            )
+        target = max(0.0, target)
+        duration = self.media_duration
+        if duration is not None:
+            target = min(target, duration)
+
+        source = self._current_cast_source()
+        if source is None:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_cast_seek_unavailable",
+            )
+
+        offset = round(target * 1000)
+        try:
+            await self.coordinator.client.async_cast_media(
+                self.serial_number,
+                source["url"],
+                title=source.get("title"),
+                stream_format=source.get("stream_format", "AUDIO_MPEG"),
+                offset_milliseconds=offset,
+            )
+        except MaikaApiError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_cast_failed",
+            ) from err
+
+        current_payload = self._current_playback.get("payload")
+        payload = dict(current_payload) if isinstance(current_payload, dict) else {}
+        payload.update(
+            {
+                "offsetInMilliseconds": offset,
+                "playbackAttributes": dict(source["attributes"]),
+            }
+        )
+        self._position_updated_at = datetime.now(dt_util.UTC)
+        self.coordinator.async_update_device_data(
+            self.serial_number,
+            {
+                "current_playback": {
+                    "status": "start",
+                    "payload": payload,
+                }
+            },
+        )
+        self._schedule_live_refresh()
 
     async def async_play_media(
         self,
@@ -266,7 +1201,21 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
         media_id: str,
         **kwargs: Any,
     ) -> None:
-        """Cast one supported audio URL to the physical MAIKA speaker."""
+        if media_type == _MEDIA_SONG:
+            await self._async_jump_to_song(media_id, kwargs.get("enqueue"))
+            return
+        if media_type == _MEDIA_CS_TRACK:
+            await self._async_cast_content_store(media_id, kwargs.get("extra"))
+            return
+        if media_type == _MEDIA_NCT_TRACK:
+            await self._async_cast_nct(media_id, kwargs.get("extra"))
+            return
+        if media_type == _MEDIA_FAVORITE_TRACK:
+            await self.async_play_media("audio/mpeg", media_id, **kwargs)
+            return
+        if nct_key := parse_nct_song_key(media_id):
+            await self._async_cast_nct(nct_key, kwargs.get("extra"))
+            return
         if not self._cloud_cast_enabled:
             raise ServiceValidationError(
                 translation_domain=DOMAIN,
@@ -310,6 +1259,7 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
             )
 
         media_url = async_process_play_media_url(self.hass, media_id)
+        media_url = cast_ready_url(self.hass, media_url, self._cast_base_url)
         self._validate_media_url(media_url)
         title = self._media_title(kwargs.get("extra"), original_media_id, media_url)
 
@@ -326,6 +1276,31 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
                 translation_key="cloud_cast_failed",
             ) from err
 
+        cast_attributes = {
+            "mediaType": normalized_media_type,
+            "media_type": normalized_media_type,
+            "title": title,
+            "url": media_url,
+        }
+        self._apply_optimistic_cast(
+            media_url, title, normalized_media_type, stream_format, cast_attributes
+        )
+
+    def _apply_optimistic_cast(
+        self,
+        media_url: str,
+        title: str,
+        media_type: str,
+        stream_format: str,
+        attributes: dict[str, Any],
+    ) -> None:
+        self._last_cast_media = {
+            "url": media_url,
+            "title": title,
+            "media_type": media_type,
+            "stream_format": stream_format,
+            "attributes": attributes,
+        }
         self._position_updated_at = datetime.now(dt_util.UTC)
         self.coordinator.async_update_device_data(
             self.serial_number,
@@ -334,17 +1309,218 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
                     "status": "start",
                     "payload": {
                         "offsetInMilliseconds": 0,
-                        "playbackAttributes": {
-                            "mediaType": normalized_media_type,
-                            "media_type": normalized_media_type,
-                            "title": title,
-                            "url": media_url,
-                        },
+                        "playbackAttributes": attributes,
                     },
                 }
             },
         )
-        await self.coordinator.async_refresh_live(self.serial_number)
+        self._schedule_live_refresh()
+
+    async def _async_cast_content_store(self, media_url: str, extra: Any) -> None:
+        if not self._cloud_cast_enabled:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_cast_disabled",
+            )
+        if not isinstance(media_url, str) or not is_valid_http_media_url(media_url):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_cast_invalid_url",
+            )
+        title = self._media_title(extra, media_url, media_url)
+        try:
+            await self.coordinator.client.async_cast_media(
+                self.serial_number,
+                media_url,
+                title=title,
+                stream_format="AUDIO_MPEG",
+            )
+        except MaikaApiError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_cast_failed",
+            ) from err
+        attributes = {
+            "mediaType": "audio",
+            "media_type": "audio",
+            "title": title,
+            "url": media_url,
+        }
+        self._apply_optimistic_cast(media_url, title, "audio", "AUDIO_MPEG", attributes)
+
+    async def _async_cast_nct(self, key: str, extra: Any) -> None:
+        if not self._cloud_cast_enabled:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="cloud_cast_disabled",
+            )
+        key = parse_nct_song_key(f"nct:{key}")
+        if key is None:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="nhaccuatui_invalid_track",
+            )
+        try:
+            track = await self._nct.async_song(key)
+        except MaikaApiError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="nhaccuatui_failed",
+            ) from err
+        stream_url = track.get("stream_url") if track else None
+        if not stream_url:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="nhaccuatui_track_unavailable",
+            )
+        title = track["title"]
+        if track.get("artist"):
+            title = f"{title} — {track['artist']}"
+        await self._async_cast_content_store(stream_url, {"title": title})
+
+    async def _async_jump_to_song(self, media_id: str, enqueue: Any) -> None:
+        if not self.available:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_unavailable",
+            )
+        if enqueue not in (None, MediaPlayerEnqueue.PLAY, MediaPlayerEnqueue.REPLACE):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_unsupported_mode",
+            )
+        if (
+            not isinstance(media_id, str)
+            or len(media_id) > _MAX_QUEUE_ITEM_ID_LENGTH
+            or (match := _QUEUE_ITEM_ID_PATTERN.fullmatch(media_id)) is None
+        ):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_invalid_selection",
+            )
+        revision, encoded_key = match.groups()
+        try:
+            key = self._valid_song_key(unquote(encoded_key, errors="strict"))
+        except UnicodeDecodeError:
+            key = None
+        if key is None or self._queue_item_id(revision, key) != media_id:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_invalid_selection",
+            )
+        try:
+            refreshed = await self.coordinator.async_refresh_live(
+                self.serial_number, required_fields=("latest_playlist",)
+            )
+        except (MaikaApiError, ConfigEntryAuthFailed) as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_refresh_failed",
+            ) from err
+        if refreshed is False:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_refresh_failed",
+            )
+        if not self.available:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_unavailable",
+            )
+        playlist, songs = self._native_playlist()
+        if revision != self._queue_revision(playlist):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_changed",
+            )
+        if not any(song.get("songKey") == key for song in songs):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_invalid_selection",
+            )
+        try:
+            await self.coordinator.client.async_playback_command(
+                self.serial_number, "JumpCommandIssued", song_key=key
+            )
+            await self.coordinator.client.async_playback_command(
+                self.serial_number, "ResumeCommandIssued"
+            )
+        except MaikaApiError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="maika_queue_jump_failed",
+            ) from err
+        selected = next((song for song in songs if song.get("songKey") == key), {})
+        self._apply_optimistic_track(selected)
+        self._schedule_live_refresh()
+
+    def _adjacent_native_song(self, step: int) -> dict[str, Any] | None:
+        _, songs = self._native_playlist()
+        attributes = self._playback_attributes
+        key = next(
+            (
+                value
+                for field in ("key", "songKey", "id")
+                if (value := self._valid_song_key(attributes.get(field))) is not None
+            ),
+            None,
+        )
+        if key is None:
+            return None
+        index = next(
+            (
+                position
+                for position, song in enumerate(songs)
+                if song.get("songKey") == key
+            ),
+            None,
+        )
+        if index is None:
+            return None
+        target = index + step
+        if target < 0 or target >= len(songs):
+            return None
+        return songs[target]
+
+    def _apply_optimistic_track(self, song: dict[str, Any]) -> None:
+        key = self._valid_song_key(song.get("songKey"))
+        if key is None:
+            return
+        attributes = dict(self._playback_attributes)
+        for field in (
+            "url",
+            "mediaId",
+            "media_id",
+            "mediaType",
+            "media_type",
+            "title",
+        ):
+            attributes.pop(field, None)
+        attributes.update({"key": key, "songKey": key})
+        self._last_cast_media = None
+        for source, target in (
+            ("song", "song"),
+            ("name", "song"),
+            ("artist", "artist"),
+            ("imageURL", "imageURL"),
+            ("image_url", "imageURL"),
+        ):
+            value = self._first_string(song.get(source))
+            if value is not None:
+                attributes[target] = value
+        self.coordinator.async_update_device_data(
+            self.serial_number,
+            {
+                "current_playback": {
+                    "status": "playing",
+                    "payload": {
+                        "offsetInMilliseconds": 0,
+                        "playbackAttributes": attributes,
+                    },
+                }
+            },
+        )
+        self._position_updated_at = datetime.now(dt_util.UTC)
 
     async def _async_playback_command(
         self, command: str, optimistic_status: str | None
@@ -354,11 +1530,55 @@ class MaikaMediaPlayer(MaikaCommandEntity, MediaPlayerEntity):
         )
         if optimistic_status is not None:
             current = dict(self._current_playback)
+            position = self.media_position
+            now = datetime.now(dt_util.UTC)
+            if position is not None:
+                if self.state == MediaPlayerState.PLAYING and self._position_updated_at:
+                    position += max(
+                        0.0, (now - self._position_updated_at).total_seconds()
+                    )
+                duration = self.media_duration
+                if duration is not None:
+                    position = min(position, duration)
+                payload = dict(current["payload"])
+                payload["offsetInMilliseconds"] = round(position * 1000)
+                current["payload"] = payload
+                self._position_updated_at = now
             current["status"] = optimistic_status
             self.coordinator.async_update_device_data(
                 self.serial_number, {"current_playback": current}
             )
-        await self.coordinator.async_refresh_live(self.serial_number)
+        self._schedule_live_refresh()
+
+    def _current_cast_source(self) -> dict[str, Any] | None:
+        """Return the media currently handed to the speaker, if any."""
+        attributes = self._playback_attributes
+        url = self._first_string(attributes.get("url"), attributes.get("mediaId"))
+        if url and is_valid_http_media_url(url):
+            return {
+                "url": url,
+                "title": self.media_title,
+                "media_type": self._first_string(
+                    attributes.get("mediaType"), attributes.get("media_type")
+                )
+                or "audio",
+                "stream_format": "AUDIO_MPEG",
+                "attributes": dict(attributes),
+            }
+        if (
+            self._last_cast_media
+            and self.state != MediaPlayerState.IDLE
+            and self.media_content_id is None
+            and self.media_title
+            and self.media_title == self._last_cast_media.get("title")
+        ):
+            return self._last_cast_media
+        return None
+
+    @callback
+    def _schedule_live_refresh(self) -> None:
+        """Refresh live data in the background so commands return fast."""
+        self.coordinator.async_schedule_playback_refresh(self.serial_number)
 
     @property
     def _current_playback(self) -> dict[str, Any]:

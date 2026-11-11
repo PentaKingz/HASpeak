@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -19,16 +20,24 @@ from .api import (
     MaikaApiClient,
     MaikaApiError,
     MaikaAuthenticationError,
+    MaikaConnectionError,
+    merge_current_playback,
 )
+from .audio_library import async_ensure_audio_library_paths, library_audio_url
+from .command_history import MaikaVoiceCommandHistoryStore
 from .const import (
     CONF_ENABLE_CLOUD_CAST,
     CONF_ENABLE_VOICE_COMMAND_SENSOR,
     CONF_SCAN_INTERVAL,
     CONF_VOICE_COMMAND_RULES,
+    CONF_VOICE_RESPONSE_TTS_ENTITY_ID,
     CONF_VOICE_SUCCESS_MEDIA_PLAYER_ENTITY_ID,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_VOICE_COMMAND_RULES,
     DOMAIN,
+    MAX_CHAT_HISTORY,
+    MAX_CHAT_MESSAGE_LENGTH,
+    MAX_VOICE_COMMAND_HISTORY,
     VOICE_SUCCESS_AUDIO_TIMING_PRIORITY,
 )
 from .media_url import is_valid_http_media_url
@@ -37,14 +46,20 @@ from .voice_rules import (
     VoiceCommandRulesError,
     normalize_voice_phrase,
     parse_voice_command_rules,
+    replace_voice_command_rule_entity_id,
 )
+from .voice_state import format_voice_state
 from .voice_success_audio import (
     has_voice_success_audio,
+    resolve_voice_success_audio_path,
     resolve_voice_success_audio_timing,
     resolve_voice_success_audio_url,
 )
 
 _LOGGER = logging.getLogger(__name__)
+_LIVE_FIELDS = ("volume", "mute", "current_playback", "latest_playlist")
+_PLAYBACK_REFRESH_DELAYS = (0, 1, 2)
+_CHAT_HISTORY_DELAYS = (0, 1, 2, 4, 8)
 
 type CoordinatorData = dict[str, Any]
 
@@ -60,8 +75,31 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
     ) -> None:
         self.entry = entry
         self.client = client
+        self._stopping = False
+        self._live_device_data: dict[str, dict[str, Any]] = {}
+        self._live_revision = 0
+        self._live_field_revisions: dict[str, dict[str, int]] = {}
+        self._playback_refresh_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._media_subscription_lock = asyncio.Lock()
+        self._media_subscription_targets: set[str] = set()
+        self._media_subscribed_generation: dict[str, int] = {}
+        self._media_subscription_pending: dict[str, int] = {}
+        self._media_subscription_task: asyncio.Task[Any] | None = None
+        self._media_subscription_generation = 0
+        self._media_subscription_task_targets: frozenset[str] = frozenset()
+        self._voice_subscription_task: asyncio.Task[Any] | None = None
+        self._voice_subscription_generation = 0
+        self._voice_subscription_pending: set[str] = set()
         self._processed_speech: dict[str, float] = {}
         self._last_voice_command: dict[str, Any] | None = None
+        self._voice_command_history: list[dict[str, Any]] = []
+        self._history_store = MaikaVoiceCommandHistoryStore(hass, entry.entry_id)
+        self._history_save_task: asyncio.Task[Any] | None = None
+        self._chat_log: list[dict[str, Any]] = []
+        self._chat_pending_serial: str | None = None
+        self._chat_sequence = 0
+        self._chat_history_seen: set[str] = set()
+        self._chat_ai_tasks: set[asyncio.Task[Any]] = set()
         self._voice_command_sequence = 0
         self._stream_frame_count = 0
         self._stream_directive_count = 0
@@ -103,7 +141,49 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             config_entry=entry,
         )
 
+    @callback
+    def async_handle_entity_registry_updated(self, event: Any) -> None:
+        """Keep voice-command rules pointing at renamed Home Assistant entities."""
+        data = getattr(event, "data", None) or {}
+        if data.get("action") != "update":
+            return
+        old_entity_id = data.get("old_entity_id")
+        new_entity_id = data.get("new_entity_id")
+        if not isinstance(old_entity_id, str) or not isinstance(new_entity_id, str):
+            return
+        current = str(
+            self.entry.options.get(
+                CONF_VOICE_COMMAND_RULES, DEFAULT_VOICE_COMMAND_RULES
+            )
+        )
+        updated = replace_voice_command_rule_entity_id(
+            current, old_entity_id, new_entity_id
+        )
+        if updated == current:
+            return
+        options = dict(self.entry.options)
+        options[CONF_VOICE_COMMAND_RULES] = updated
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
+        _LOGGER.info(
+            "Updated MAIKA voice command rules after entity rename: %s -> %s",
+            old_entity_id,
+            new_entity_id,
+        )
+
+    async def _async_setup(self) -> None:
+        """Restore the persisted voice-command history before first refresh."""
+        try:
+            history = await self._history_store.async_load()
+        except Exception:  # history storage must never block setup
+            _LOGGER.debug("Unable to load MAIKA command history", exc_info=True)
+            return
+        if history:
+            self._voice_command_history = history[:MAX_VOICE_COMMAND_HISTORY]
+
     async def _async_update_data(self) -> CoordinatorData:
+        if self._stopping:
+            return self.data or {"devices": {}}
+        previous_devices = self.data.get("devices", {}) if self.data else {}
         try:
             listed_devices = await self.client.async_list_devices()
             details = await asyncio.gather(
@@ -111,6 +191,17 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             )
         except MaikaAuthenticationError as err:
             raise ConfigEntryAuthFailed from err
+        except MaikaConnectionError as err:
+            if (
+                self.data
+                and self.client.listener_connected
+                and (err.status is None or err.is_server_error)
+            ):
+                _LOGGER.warning(
+                    "MAIKA cloud REST is temporarily unavailable; keeping cached devices"
+                )
+                return self.data
+            raise UpdateFailed(str(err)) from err
         except MaikaApiError as err:
             raise UpdateFailed(str(err)) from err
 
@@ -127,22 +218,64 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             merged = {**listed, **detail}
             serial_number = merged.get("device_id")
             if isinstance(serial_number, str) and serial_number:
-                devices[serial_number] = merged
+                devices[serial_number] = {
+                    **{
+                        key: value
+                        for key, value in previous_devices.get(
+                            serial_number, {}
+                        ).items()
+                        if key in _LIVE_FIELDS
+                    },
+                    **merged,
+                }
 
+        if self._stopping:
+            return self.data or {"devices": {}}
+        self._media_subscription_targets = set(devices)
+        for serial_number, device in devices.items():
+            latest = self._live_device_data.setdefault(serial_number, {})
+            for key in _LIVE_FIELDS:
+                if key in device and key not in latest:
+                    latest[key] = deepcopy(device[key])
+        for serial_number in tuple(self._playback_refresh_tasks):
+            if serial_number not in devices:
+                self._playback_refresh_tasks.pop(serial_number).cancel()
+        self._schedule_media_subscriptions()
+        if self._media_subscription_task is not None:
+            await asyncio.gather(self._media_subscription_task, return_exceptions=True)
         live_results = await asyncio.gather(
-            *(
-                self.client.async_request_device_info(serial_number)
-                for serial_number in devices
-            ),
+            *(self.async_refresh_live(serial_number) for serial_number in devices),
             return_exceptions=True,
         )
         for serial_number, live_result in zip(devices, live_results, strict=True):
-            if isinstance(live_result, dict):
-                devices[serial_number] = self._merge_live_data(
-                    devices[serial_number], live_result
-                )
-
-        await self._async_ensure_voice_subscriptions(devices)
+            if live_result is True:
+                devices[serial_number] = {**devices[serial_number], "online": True}
+        self._schedule_voice_subscriptions(devices)
+        if self._voice_subscription_task is not None:
+            await asyncio.gather(self._voice_subscription_task, return_exceptions=True)
+        if self._stopping:
+            return self.data or {"devices": {}}
+        for serial_number, live in self._live_device_data.items():
+            if serial_number in devices:
+                revisions = self._live_field_revisions.get(serial_number, {})
+                devices[serial_number] = {
+                    **devices[serial_number],
+                    **{
+                        key: deepcopy(value)
+                        for key, value in live.items()
+                        if key in revisions
+                    },
+                }
+        self._live_device_data = {
+            serial: live
+            for serial, live in self._live_device_data.items()
+            if serial in devices
+        }
+        self._live_field_revisions = {
+            serial: revisions
+            for serial, revisions in self._live_field_revisions.items()
+            if serial in devices
+        }
 
         voice_options = {
             str(voice["code"]): str(voice.get("name") or voice["code"])
@@ -157,8 +290,231 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             "voices": voice_options,
             "voice_command_rule_count": len(self._voice_command_rules),
             "last_voice_command": self._last_voice_command,
+            "voice_command_history": list(self._voice_command_history),
             **self._stream_diagnostics_data(),
         }
+
+    @property
+    def voice_command_history(self) -> list[dict[str, Any]]:
+        """Return recent recognized commands, newest first."""
+        return list(self._voice_command_history)
+
+    @callback
+    def _remember_voice_command(self) -> None:
+        """Keep the latest finalized command in the recent-history list."""
+        command = self._last_voice_command
+        if not isinstance(command, dict) or command.get("executed") is None:
+            return
+        stored = {
+            key: value
+            for key, value in command.items()
+            if key not in {"message_id", "source_session", "service_data"}
+        }
+        identity = f"{command.get('received_at')}|{command.get('normalized')}"
+        for index, existing in enumerate(self._voice_command_history):
+            existing_identity = (
+                f"{existing.get('received_at')}|{existing.get('normalized')}"
+            )
+            if existing_identity == identity:
+                self._voice_command_history[index] = stored
+                break
+        else:
+            self._voice_command_history.insert(0, stored)
+        del self._voice_command_history[MAX_VOICE_COMMAND_HISTORY:]
+        self._schedule_history_save()
+
+    @callback
+    def _schedule_history_save(self) -> None:
+        """Persist the command history without blocking the event loop."""
+        task = self._history_save_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._history_save_task = self.entry.async_create_background_task(
+            self.hass,
+            self._history_store.async_save(list(self._voice_command_history)),
+            "MAIKA command history save",
+        )
+
+    @property
+    def chat_log(self) -> list[dict[str, Any]]:
+        """Return the recent speaker chat turns, oldest first."""
+        return [dict(turn) for turn in self._chat_log]
+
+    async def async_send_chat(self, serial_number: str, text: str) -> dict[str, Any]:
+        """Send a typed utterance to one speaker and record the user turn."""
+        message = (text or "").strip()
+        if not message:
+            return {"ok": False, "error": "empty_message"}
+        if len(message) > MAX_CHAT_MESSAGE_LENGTH:
+            return {"ok": False, "error": "message_too_long"}
+        if serial_number not in (self.data or {}).get("devices", {}):
+            return {"ok": False, "error": "unknown_speaker"}
+        try:
+            await self.client.async_send_voice_text(serial_number, message)
+        except MaikaApiError:
+            _LOGGER.debug("Unable to send MAIKA chat message", exc_info=True)
+            return {"ok": False, "error": "send_failed"}
+        self._append_chat("user", message, serial_number)
+        self._chat_pending_serial = serial_number
+        self._chat_sequence += 1
+        self._schedule_chat_reply(
+            self._async_capture_ai_reply(serial_number, message, self._chat_sequence),
+            "MAIKA AI chat reply",
+        )
+        self._schedule_chat_reply(
+            self._async_capture_history_reply(
+                serial_number, message, self._chat_sequence
+            ),
+            "MAIKA chat history reply",
+        )
+        return {"ok": True, "chat": self.chat_log}
+
+    @callback
+    def _schedule_chat_reply(self, coroutine: Any, name: str) -> None:
+        task = self.entry.async_create_background_task(self.hass, coroutine, name)
+        self._chat_ai_tasks.add(task)
+        task.add_done_callback(self._chat_ai_tasks.discard)
+
+    def _chat_reply_still_needed(self, serial_number: str, sequence: int) -> bool:
+        return (
+            not self._stopping
+            and self._chat_pending_serial == serial_number
+            and self._chat_sequence == sequence
+        )
+
+    def _apply_chat_reply(self, serial_number: str, sequence: int, reply: str) -> bool:
+        if not reply or not self._chat_reply_still_needed(serial_number, sequence):
+            return False
+        self._chat_pending_serial = None
+        self._append_chat("assistant", reply, serial_number)
+        return True
+
+    async def _async_capture_ai_reply(
+        self, serial_number: str, message: str, sequence: int
+    ) -> None:
+        """Append the textual AI reply used by the MAIKA app chat screen."""
+        try:
+            reply = await self.client.async_chat_ai(message, retry_auth=False)
+        except Exception:  # background chat errors must never break the stream
+            _LOGGER.debug("Unable to fetch MAIKA AI chat reply", exc_info=True)
+            return
+        self._apply_chat_reply(serial_number, sequence, reply)
+
+    @staticmethod
+    def _history_exchange(item: dict[str, Any]) -> tuple[str | None, str | None]:
+        data = item.get("data")
+        if not isinstance(data, dict):
+            return None, None
+        header = data.get("header")
+        raw_speech = None
+        if isinstance(header, dict):
+            for key in ("rawSpeech", "raw_speech"):
+                value = header.get(key)
+                if isinstance(value, str) and value.strip():
+                    raw_speech = value.strip()
+                    break
+        response = data.get("response")
+        reply = None
+        if isinstance(response, dict):
+            items = response.get("items")
+            if isinstance(items, list):
+                for entry in items:
+                    if not isinstance(entry, dict):
+                        continue
+                    simple = entry.get("simpleResponse")
+                    if not isinstance(simple, dict):
+                        continue
+                    for key in ("displayText", "textToSpeech", "ssml"):
+                        value = simple.get(key)
+                        if isinstance(value, str) and value.strip():
+                            reply = value.strip()
+                            break
+                    if reply is not None:
+                        break
+        return raw_speech, reply
+
+    async def _async_capture_history_reply(
+        self, serial_number: str, message: str, sequence: int
+    ) -> None:
+        """Read the real speaker reply from the app's message history."""
+        expected = normalize_voice_phrase(message)
+        for delay in _CHAT_HISTORY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            if not self._chat_reply_still_needed(serial_number, sequence):
+                return
+            try:
+                history = await self.client.async_get_message_history(
+                    serial_number, retry_auth=False
+                )
+            except Exception:  # a failed history poll is non-fatal
+                _LOGGER.debug("Unable to read MAIKA chat history", exc_info=True)
+                continue
+            for item in history:
+                raw_speech, reply = self._history_exchange(item)
+                if not reply or not raw_speech:
+                    continue
+                if normalize_voice_phrase(raw_speech) != expected:
+                    continue
+                identity = str(item.get("id") or "").strip()
+                if identity and identity in self._chat_history_seen:
+                    continue
+                if identity:
+                    self._chat_history_seen.add(identity)
+                    if len(self._chat_history_seen) > 256:
+                        self._chat_history_seen.clear()
+                if self._apply_chat_reply(serial_number, sequence, reply):
+                    return
+
+    @callback
+    def _append_chat(self, role: str, text: str, serial_number: str) -> None:
+        self._chat_log.append(
+            {
+                "role": role,
+                "text": text,
+                "serial_number": serial_number,
+                "at": datetime.now(UTC).isoformat(),
+            }
+        )
+        del self._chat_log[:-MAX_CHAT_HISTORY]
+
+    @callback
+    def _maybe_capture_assistant_reply(
+        self, header: dict[str, Any], frame: dict[str, Any]
+    ) -> None:
+        """Attach a spoken assistant reply to the pending chat turn."""
+        if not self._chat_pending_serial:
+            return
+        if str(header.get("type", "")).casefold() == "speakerconversationresponse":
+            return
+        namespace = str(header.get("namespace", "")).casefold()
+        if namespace not in ("texttospeech", "speechsynthesizer"):
+            return
+        text = self._extract_speech_text(frame)
+        if not text:
+            return
+        serial_number = self._chat_pending_serial
+        self._chat_pending_serial = None
+        self._append_chat("assistant", text, serial_number)
+
+    @classmethod
+    def _extract_speech_text(cls, frame: dict[str, Any]) -> str | None:
+        """Best-effort extraction of display text from a TTS directive frame."""
+        response = frame.get("response")
+        if isinstance(response, dict):
+            items = response.get("items")
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    simple = item.get("simpleResponse")
+                    if not isinstance(simple, dict):
+                        continue
+                    for key in ("displayText", "textToSpeech", "ssml"):
+                        value = simple.get(key)
+                        if isinstance(value, str) and value.strip():
+                            return value.strip()
+        return None
 
     async def _async_get_detail(self, listed_device: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -169,31 +525,99 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         except (KeyError, TypeError, ValueError, MaikaApiError):
             return listed_device
 
-    async def async_refresh_live(self, serial_number: str) -> None:
+    async def async_refresh_live(
+        self, serial_number: str, *, required_fields: tuple[str, ...] = ()
+    ) -> bool:
         """Refresh live volume, mute and playback data for one speaker."""
+        if self._stopping:
+            return False
+        revision = self._live_revision
         try:
             live = await self.client.async_request_device_info(serial_number)
         except MaikaAuthenticationError as err:
             raise ConfigEntryAuthFailed from err
         except MaikaApiError:
+            return False
+        if self._stopping or not isinstance(live, dict):
+            return False
+        revisions = self._live_field_revisions.get(serial_number, {})
+        changes = {
+            key: live[key]
+            for key in _LIVE_FIELDS
+            if key in live and revisions.get(key, 0) <= revision
+        }
+        if changes:
+            self.async_update_device_data(serial_number, changes)
+        if required_fields:
+            return all(
+                key in live or revisions.get(key, 0) > revision
+                for key in required_fields
+            )
+        return any(key in live for key in _LIVE_FIELDS)
+
+    @callback
+    def async_schedule_playback_refresh(self, serial_number: str) -> None:
+        if self._stopping or not self.data:
             return
-        if live:
-            self.async_update_device_data(serial_number, live)
+        if serial_number not in self.data.get("devices", {}):
+            return
+        previous = self._playback_refresh_tasks.pop(serial_number, None)
+        if previous is not None:
+            previous.cancel()
+        self._playback_refresh_tasks[serial_number] = (
+            self.entry.async_create_background_task(
+                self.hass,
+                self._async_playback_refresh(serial_number),
+                "MAIKA playback follow-up refresh",
+            )
+        )
+
+    async def _async_playback_refresh(self, serial_number: str) -> None:
+        try:
+            for delay in _PLAYBACK_REFRESH_DELAYS:
+                if delay:
+                    await asyncio.sleep(delay)
+                if self._stopping or not self.data:
+                    return
+                if serial_number not in self.data.get("devices", {}):
+                    return
+                try:
+                    await self.async_refresh_live(serial_number)
+                except ConfigEntryAuthFailed:
+                    return
+        finally:
+            if (
+                self._playback_refresh_tasks.get(serial_number)
+                is asyncio.current_task()
+            ):
+                self._playback_refresh_tasks.pop(serial_number, None)
 
     @callback
     def async_update_device_data(
         self, serial_number: str, changes: dict[str, Any]
     ) -> None:
         """Apply optimistic or stream-driven changes to coordinator data."""
-        if not self.data:
+        if self._stopping:
             return
-        devices = self.data.get("devices")
-        if not isinstance(devices, dict) or serial_number not in devices:
+        changes = {key: changes[key] for key in _LIVE_FIELDS if key in changes}
+        if not changes:
+            return
+        devices = self.data.get("devices", {}) if self.data else {}
+        current = {
+            **self._live_device_data.get(serial_number, {}),
+            **devices.get(serial_number, {}),
+        }
+        merged = self._merge_live_data(current, changes)
+        self._live_revision += 1
+        revisions = self._live_field_revisions.setdefault(serial_number, {})
+        latest = self._live_device_data.setdefault(serial_number, {})
+        for key in changes:
+            latest[key] = deepcopy(merged[key])
+            revisions[key] = self._live_revision
+        if serial_number not in devices:
             return
         updated_devices = dict(devices)
-        updated_devices[serial_number] = self._merge_live_data(
-            devices[serial_number], changes
-        )
+        updated_devices[serial_number] = merged
         self.async_set_updated_data(
             {
                 **self.data,
@@ -205,11 +629,14 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
     @callback
     def async_handle_stream_frame(self, frame: dict[str, Any]) -> None:
         """Handle decoded frames emitted by the MAIKA /connect stream."""
+        if self._stopping:
+            return
         frame = self._normalize_stream_frame(frame)
         self._record_stream_frame(frame)
         self._publish_stream_diagnostics()
 
         if self._is_connect_frame(frame):
+            self._schedule_media_subscriptions()
             self._schedule_voice_subscriptions()
             return
 
@@ -218,9 +645,14 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if not isinstance(header, dict):
             return
 
+        try:
+            self._maybe_capture_assistant_reply(header, frame)
+        except Exception:  # chat capture must never block voice commands
+            _LOGGER.debug("Unable to capture MAIKA chat reply", exc_info=True)
+
         if (
-            header.get("name") == "DeviceInfo"
-            and header.get("namespace") == "ClientInformation"
+            str(header.get("name", "")).casefold() == "deviceinfo"
+            and str(header.get("namespace", "")).casefold() == "clientinformation"
             and isinstance(payload, dict)
         ):
             serial_number = payload.get("deviceId") or payload.get("device_id")
@@ -276,10 +708,126 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             server_message_id=server_message_id,
         )
 
+    async def _async_ensure_media_subscriptions(self) -> None:
+        if self._stopping or not self.client.listener_connected:
+            return
+        async with self._media_subscription_lock:
+            generation = self.client.listener_generation
+            if self._stopping or not self.client.listener_connected or generation <= 0:
+                return
+            subscriptions = {
+                **self._media_subscribed_generation,
+                **self._media_subscription_pending,
+            }
+            for serial_number, subscribed in subscriptions.items():
+                if serial_number in self._media_subscription_targets:
+                    continue
+                if subscribed == generation:
+                    try:
+                        await self.client.async_stop_media_listening(serial_number)
+                    except MaikaApiError:
+                        _LOGGER.debug("Unable to stop one MAIKA media subscription")
+                        continue
+                self._media_subscribed_generation.pop(serial_number, None)
+                self._media_subscription_pending.pop(serial_number, None)
+            for serial_number in tuple(self._media_subscription_targets):
+                if serial_number not in self._media_subscription_targets:
+                    continue
+                if (
+                    self._stopping
+                    or not self.client.listener_connected
+                    or self.client.listener_generation != generation
+                ):
+                    return
+                if self._media_subscribed_generation.get(serial_number) == generation:
+                    continue
+                self._media_subscription_pending[serial_number] = generation
+                try:
+                    await self.client.async_start_media_listening(serial_number)
+                except MaikaApiError:
+                    _LOGGER.debug("Unable to register one MAIKA media subscription")
+                else:
+                    self._media_subscribed_generation[serial_number] = generation
+                self._media_subscription_pending.pop(serial_number, None)
+
+    @callback
+    def _schedule_media_subscriptions(self) -> None:
+        if self._stopping:
+            return
+        generation = self.client.listener_generation
+        targets = frozenset(self._media_subscription_targets)
+        task = self._media_subscription_task
+        if task is not None and not task.done():
+            if (
+                self._media_subscription_generation == generation
+                and self._media_subscription_task_targets == targets
+            ):
+                return
+            task.cancel()
+        self._media_subscription_generation = generation
+        self._media_subscription_task_targets = targets
+        self._media_subscription_task = self.entry.async_create_background_task(
+            self.hass,
+            self._async_ensure_media_subscriptions(),
+            "MAIKA speaker media subscriptions",
+        )
+
+    async def async_stop(self) -> None:
+        self._stopping = True
+        tasks = [
+            *self._playback_refresh_tasks.values(),
+            self._media_subscription_task,
+            self._voice_subscription_task,
+            *self._chat_ai_tasks,
+        ]
+        pending = [task for task in tasks if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._playback_refresh_tasks.clear()
+        self._chat_ai_tasks.clear()
+        self._chat_history_seen.clear()
+        try:
+            async with asyncio.timeout(10), self._media_subscription_lock:
+                for serial_number in (
+                    self._media_subscribed_generation.keys()
+                    | self._media_subscription_pending.keys()
+                ):
+                    try:
+                        await self.client.async_stop_media_listening(serial_number)
+                    except MaikaApiError:
+                        _LOGGER.debug("Unable to stop one MAIKA media subscription")
+        except TimeoutError:
+            _LOGGER.debug("Timed out stopping MAIKA media subscriptions")
+        self._media_subscribed_generation.clear()
+        self._media_subscription_pending.clear()
+        self._media_subscription_targets.clear()
+        self._live_device_data.clear()
+        self._live_field_revisions.clear()
+        await self.async_stop_voice_subscriptions()
+        await self._async_flush_history()
+
+    async def _async_flush_history(self) -> None:
+        """Write the pending command history to storage on shutdown."""
+        task = self._history_save_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._history_save_task = None
+        try:
+            async with asyncio.timeout(5):
+                await self._history_store.async_save(list(self._voice_command_history))
+        except TimeoutError:
+            _LOGGER.debug("Timed out saving MAIKA command history")
+        except Exception:  # never fail shutdown on storage
+            _LOGGER.debug("Unable to save MAIKA command history", exc_info=True)
+
     async def _async_ensure_voice_subscriptions(
         self, devices: dict[str, dict[str, Any]]
     ) -> None:
         """Subscribe the current cloud connection to every MAIKA speaker."""
+        if self._stopping:
+            return
         if not self._voice_stream_enabled():
             self._voice_subscription_target_count = 0
             self._voice_subscription_status = "disabled"
@@ -296,6 +844,8 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             return
 
         async with self._voice_subscription_lock:
+            if self._stopping:
+                return
             generation = self.client.listener_generation
             if not self.client.listener_connected or generation <= 0:
                 self._voice_subscription_status = "waiting_for_stream"
@@ -311,9 +861,16 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             attempted = False
             failed = False
             for serial_number in devices:
+                if (
+                    self._stopping
+                    or not self.client.listener_connected
+                    or self.client.listener_generation != generation
+                ):
+                    return
                 if self._voice_subscribed_generation.get(serial_number) == generation:
                     continue
                 attempted = True
+                self._voice_subscription_pending.add(serial_number)
                 try:
                     await self.client.async_start_conversation_listening(serial_number)
                 except MaikaAuthenticationError:
@@ -326,6 +883,7 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     _LOGGER.debug("Unable to register one MAIKA voice subscription")
                 else:
                     self._voice_subscribed_generation[serial_number] = generation
+                self._voice_subscription_pending.discard(serial_number)
 
             if attempted:
                 self._voice_subscription_last_at = datetime.now(UTC).isoformat()
@@ -345,11 +903,12 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
     async def async_stop_voice_subscriptions(self) -> None:
         """Best-effort StopListening for subscriptions created by this entry."""
-        serial_numbers = tuple(self._voice_subscribed_generation)
-        if not serial_numbers:
-            return
         try:
-            async with asyncio.timeout(10):
+            async with asyncio.timeout(10), self._voice_subscription_lock:
+                serial_numbers = (
+                    self._voice_subscribed_generation.keys()
+                    | self._voice_subscription_pending
+                )
                 for serial_number in serial_numbers:
                     try:
                         await self.client.async_stop_conversation_listening(
@@ -360,16 +919,27 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         except TimeoutError:
             _LOGGER.debug("Timed out stopping MAIKA voice subscriptions")
         self._voice_subscribed_generation.clear()
+        self._voice_subscription_pending.clear()
 
     @callback
-    def _schedule_voice_subscriptions(self) -> None:
+    def _schedule_voice_subscriptions(
+        self, devices: dict[str, dict[str, Any]] | None = None
+    ) -> None:
         """Re-register voice subscriptions after a stream reconnect."""
-        if not self._voice_stream_enabled() or not self.data:
+        if self._stopping or not self._voice_stream_enabled():
             return
-        devices = self.data.get("devices")
+        if devices is None:
+            devices = self.data.get("devices") if self.data else None
         if not isinstance(devices, dict):
             return
-        self.entry.async_create_background_task(
+        generation = self.client.listener_generation
+        task = self._voice_subscription_task
+        if task is not None and not task.done():
+            if self._voice_subscription_generation == generation:
+                return
+            task.cancel()
+        self._voice_subscription_generation = generation
+        self._voice_subscription_task = self.entry.async_create_background_task(
             self.hass,
             self._async_ensure_voice_subscriptions(devices),
             "MAIKA speaker conversation subscriptions",
@@ -391,7 +961,11 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         rule = self._voice_command_rules.get(normalized)
         entity_state = self.hass.states.get(rule.entity_id) if rule else None
         service = rule.service if rule else None
-        success_audio_enabled = rule is not None and self._voice_success_audio_enabled()
+        success_audio_enabled = (
+            rule is not None
+            and not rule.is_read
+            and self._voice_success_audio_enabled()
+        )
         self._voice_command_sequence += 1
         sequence = self._voice_command_sequence
         self._last_voice_command = {
@@ -409,6 +983,7 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             "entity_state_after": None,
             "executed": False,
             "error": None,
+            "response_text": None,
             "success_audio_timing": (
                 self._voice_success_audio_timing() if success_audio_enabled else None
             ),
@@ -418,17 +993,133 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._publish_last_voice_command()
 
         if rule is not None:
-            self.entry.async_create_background_task(
-                self.hass,
-                self._async_execute_voice_rule(
+            action = (
+                self._async_execute_voice_read(rule, sequence=sequence)
+                if rule.is_read
+                else self._async_execute_voice_rule(
                     rule,
                     sequence=sequence,
                     dialog_request_id=dialog_request_id,
                     message_id=conversation_message_id,
                     server_message_id=server_message_id,
-                ),
+                )
+            )
+            self.entry.async_create_background_task(
+                self.hass,
+                action,
                 "MAIKA voice command action",
             )
+
+    async def _async_execute_voice_read(
+        self,
+        rule: VoiceCommandRule,
+        *,
+        sequence: int,
+    ) -> None:
+        """Speak the current state of a read-only voice rule target."""
+        response_text: str | None = None
+        executed = False
+        error: str | None = None
+        entity_state = self.hass.states.get(rule.entity_id)
+
+        if entity_state is None:
+            error = "entity_not_found"
+            _LOGGER.warning(
+                "MAIKA voice read target %s does not exist",
+                rule.entity_id,
+            )
+        else:
+            response_text = format_voice_state(entity_state)
+            status, error = await self._async_speak_voice_response(response_text)
+            executed = status == "played"
+
+        if sequence != self._voice_command_sequence or self._last_voice_command is None:
+            return
+        entity_state_after = self.hass.states.get(rule.entity_id)
+        self._last_voice_command = {
+            **self._last_voice_command,
+            "entity_state_after": (
+                entity_state_after.state if entity_state_after else None
+            ),
+            "executed": executed,
+            "error": error,
+            "response_text": response_text,
+        }
+        self._publish_last_voice_command()
+
+    async def _async_speak_voice_response(
+        self, response_text: str
+    ) -> tuple[str, str | None]:
+        """Render a spoken answer on the configured MAIKA speaker via TTS."""
+        if not self.entry.options.get(CONF_ENABLE_CLOUD_CAST, False):
+            return "failed", "cloud_cast_disabled"
+        if not self.hass.services.has_service("tts", "speak"):
+            return "failed", "tts_not_supported"
+
+        tts_entity_id, tts_error = self._voice_response_tts_entity_id()
+        if tts_entity_id is None:
+            return "failed", tts_error
+        media_player_entity_id, player_error = self._voice_media_player_for_response()
+        if media_player_entity_id is None:
+            return "failed", player_error
+
+        try:
+            await self.hass.services.async_call(
+                "tts",
+                "speak",
+                {
+                    "entity_id": tts_entity_id,
+                    "media_player_entity_id": media_player_entity_id,
+                    "message": response_text,
+                    "cache": True,
+                },
+                blocking=True,
+                context=Context(),
+            )
+        except Exception as err:
+            error_type = type(err).__name__
+            _LOGGER.warning("MAIKA voice response TTS failed (%s)", error_type)
+            return "failed", error_type
+        return "played", None
+
+    def _voice_response_tts_entity_id(self) -> tuple[str | None, str | None]:
+        """Resolve the configured TTS entity or the only TTS entity."""
+        configured_entity_id = str(
+            self.entry.options.get(CONF_VOICE_RESPONSE_TTS_ENTITY_ID, "")
+        ).strip()
+        if configured_entity_id:
+            if self.hass.states.get(configured_entity_id) is None:
+                return None, "tts_not_found"
+            return configured_entity_id, None
+
+        entity_ids = tuple(self.hass.states.async_entity_ids("tts"))
+        if len(entity_ids) == 1:
+            return entity_ids[0], None
+        if not entity_ids:
+            return None, "tts_not_configured"
+        return None, "tts_not_selected"
+
+    def _voice_media_player_for_response(self) -> tuple[str | None, str | None]:
+        """Validate that the answer will play on a speaker from this entry."""
+        media_player_entity_id, error = self._voice_success_media_player_entity_id()
+        if media_player_entity_id is None:
+            return None, error
+
+        registry_entry = er.async_get(self.hass).async_get(media_player_entity_id)
+        if registry_entry is None:
+            return None, "media_player_not_found"
+        if (
+            registry_entry.domain != Platform.MEDIA_PLAYER
+            or registry_entry.platform != DOMAIN
+            or registry_entry.config_entry_id != self.entry.entry_id
+        ):
+            return None, "media_player_not_maika_entry"
+        state = self.hass.states.get(media_player_entity_id)
+        if state is None:
+            return None, "media_player_not_found"
+        if state.state == STATE_UNAVAILABLE:
+            return None, "media_player_unavailable"
+        return media_player_entity_id, None
 
     async def _async_execute_voice_rule(
         self,
@@ -581,7 +1272,13 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         audio_url = resolve_voice_success_audio_url(self.entry.options)
         if not audio_url:
-            return "failed", "audio_url_not_configured"
+            library_path = resolve_voice_success_audio_path(self.entry.options)
+            if not library_path:
+                return "failed", "audio_url_not_configured"
+            await async_ensure_audio_library_paths(self.hass)
+            audio_url = library_audio_url(self.hass, library_path)
+            if not audio_url:
+                return "failed", "audio_library_unavailable"
         if not is_valid_http_media_url(audio_url):
             return "failed", "audio_url_invalid"
 
@@ -682,10 +1379,12 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         """Notify coordinator entities about the latest voice command."""
         if not self.data:
             return
+        self._remember_voice_command()
         self.async_set_updated_data(
             {
                 **self.data,
                 "last_voice_command": self._last_voice_command,
+                "voice_command_history": list(self._voice_command_history),
                 **self._stream_diagnostics_data(),
             }
         )
@@ -707,9 +1406,13 @@ class MaikaDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         device: dict[str, Any], live: dict[str, Any]
     ) -> dict[str, Any]:
         merged = dict(device)
-        for key in ("volume", "mute", "current_playback", "latest_playlist"):
+        for key in _LIVE_FIELDS:
             if key in live:
-                merged[key] = live[key]
+                merged[key] = (
+                    merge_current_playback(device.get(key), live[key])
+                    if key == "current_playback"
+                    else deepcopy(live[key])
+                )
         return merged
 
     def _voice_stream_enabled(self) -> bool:

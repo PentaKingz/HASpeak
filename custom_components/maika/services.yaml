@@ -1,0 +1,186 @@
+create_reminder:
+  fields:
+    device_id:
+      selector:
+        device:
+          integration: maika
+    entry_id:
+      selector:
+        config_entry:
+          integration: maika
+    serial_number:
+      selector:
+        text:
+    event:
+      required: true
+      selector:
+        text:
+    start_at:
+      required: true
+      selector:
+        datetime:
+    frequency:
+      default: once
+      selector:
+        select:
+          options:
+            - label: Once
+              value: once
+            - label: Daily
+              value: daily
+            - label: Weekly
+              value: weekly
+            - label: Monthly
+              value: monthly
+            - label: Yearly
+              value: yearly
+    alert_prior:
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 1440
+          unit_of_measurement: minutes
+          mode: box
+    custom_tts:
+      selector:
+        text:
+
+update_reminder:
+  fields:
+    device_id:
+      selector:
+        device:
+          integration: maika
+    entry_id:
+      selector:
+        config_entry:
+          integration: maika
+    serial_number:
+      selector:
+        text:
+    reminder_id:
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+    event:
+      selector:
+        text:
+    start_at:
+      selector:
+        datetime:
+    frequency:
+      selector:
+        select:
+          options:
+            - label: Once
+              value: once
+            - label: Daily
+              value: daily
+            - label: Weekly
+              value: weekly
+            - label: Monthly
+              value: monthly
+            - label: Yearly
+              value: yearly
+    alert_prior:
+      selector:
+        number:
+          min: 0
+          max: 1440
+          unit_of_measurement: minutes
+          mode: box
+    custom_tts:
+      selector:
+        text:
+    status:
+      selector:
+        select:
+          options:
+            - label: Enabled
+              value: "1"
+            - label: Disabled
+              value: "2"
+
+set_reminder_enabled:
+  fields:
+    device_id:
+      selector:
+        device:
+          integration: maika
+    entry_id:
+      selector:
+        config_entry:
+          integration: maika
+    serial_number:
+      selector:
+        text:
+    reminder_id:
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+    enabled:
+      required: true
+      selector:
+        boolean:
+
+delete_reminders:
+  fields:
+    device_id:
+      selector:
+        device:
+          integration: maika
+    entry_id:
+      selector:
+        config_entry:
+          integration: maika
+    serial_number:
+      selector:
+        text:
+    reminder_ids:
+      required: true
+      selector:
+        text:
+          multiple: true
+
+mute_reminders:
+  fields:
+    device_id:
+      selector:
+        device:
+          integration: maika
+    entry_id:
+      selector:
+        config_entry:
+          integration: maika
+    serial_number:
+      selector:
+        text:
+    reminder_ids:
+      required: true
+      selector:
+        text:
+          multiple: true
+    mute_days:
+      required: true
+      selector:
+        text:
+          multiple: true
+
+add_current_to_favorites:
+  fields:
+    device_id:
+      selector:
+        device:
+          integration: maika
+    entry_id:
+      selector:
+        config_entry:
+          integration: maika
+    serial_number:
+      selector:
+        text:

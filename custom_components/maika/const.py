@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 DOMAIN = "maika"
-INTEGRATION_VERSION = "1.8.1"
+INTEGRATION_VERSION = "1.29.9"
 
 APP_VERSION = "3.2.3"
 APP_DEVICE_TYPE = "android"
 APP_LANGUAGE = "vi-VN"
 APP_TIMEZONE = "Asia/Ho_Chi_Minh"
 APP_ORGANIZATION_CODE = "MAIKA"
+APP_EXECUTOR = "vn_south"
 
 USERS_BASE_URL = "https://users.iviet.com"
 CHATBOT_BASE_URL = "https://chatbot.iviet.com"
+CONTENT_STORE_GRAPHQL_URL = "https://core.ocs.iviet.com/v1/graphql"
+CONTENT_GATEWAY_BASE_URL = "https://content-gateway.maika.ai"
+NCT_API_BASE_URL = "https://graph.nhaccuatui.com"
 
 CONF_PHONE_NUMBER = "phone_number"
 CONF_PASSWORD = "password"
@@ -20,12 +24,15 @@ CONF_CLIENT_ID = "client_id"
 CONF_SESSION_ID = "session_id"
 CONF_SCAN_INTERVAL = "scan_interval"
 CONF_ENABLE_CLOUD_CAST = "enable_experimental_cloud_cast"
+CONF_CLOUD_CAST_BASE_URL = "cloud_cast_base_url"
 CONF_ENABLE_VOICE_COMMAND_SENSOR = "enable_voice_command_sensor"
 CONF_VOICE_COMMAND_RULES = "voice_command_rules"
 CONF_VOICE_SUCCESS_AUDIO_SOURCE = "voice_success_audio_source"
 CONF_VOICE_SUCCESS_AUDIO_TIMING = "voice_success_audio_timing"
 CONF_VOICE_SUCCESS_MEDIA_PLAYER_ENTITY_ID = "voice_success_media_player_entity_id"
 CONF_VOICE_SUCCESS_AUDIO_URL = "voice_success_audio_url"
+CONF_VOICE_SUCCESS_AUDIO_PATH = "voice_success_audio_path"
+CONF_VOICE_RESPONSE_TTS_ENTITY_ID = "voice_response_tts_entity_id"
 
 DEFAULT_SCAN_INTERVAL = 60
 MIN_SCAN_INTERVAL = 15
@@ -33,12 +40,33 @@ MAX_SCAN_INTERVAL = 3600
 DEFAULT_VOICE_COMMAND_RULES = ""
 VOICE_SUCCESS_AUDIO_SOURCE_DISABLED = "disabled"
 VOICE_SUCCESS_AUDIO_SOURCE_BUNDLED = "bundled"
+VOICE_SUCCESS_AUDIO_SOURCE_LIBRARY = "library"
 VOICE_SUCCESS_AUDIO_SOURCE_CUSTOM = "custom"
 VOICE_SUCCESS_AUDIO_SOURCE_OPTIONS = (
     VOICE_SUCCESS_AUDIO_SOURCE_DISABLED,
     VOICE_SUCCESS_AUDIO_SOURCE_BUNDLED,
+    VOICE_SUCCESS_AUDIO_SOURCE_LIBRARY,
     VOICE_SUCCESS_AUDIO_SOURCE_CUSTOM,
 )
+VOICE_SUCCESS_AUDIO_LIBRARY_DIRS = ("www", "mp3", "media")
+VOICE_SUCCESS_AUDIO_LIBRARY_EXTENSIONS = (
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".wav",
+    ".ogg",
+    ".oga",
+    ".flac",
+)
+MAX_VOICE_SUCCESS_AUDIO_LIBRARY_FILES = 500
+MAX_VOICE_SUCCESS_AUDIO_LIBRARY_DEPTH = 4
+BUNDLED_VOICE_SUCCESS_AUDIO_URL = (
+    "https://maika-license-admin-vercel.vercel.app/mp3/maika.mp3"
+)
+
+MAX_VOICE_COMMAND_HISTORY = 20
+MAX_CHAT_HISTORY = 50
+MAX_CHAT_MESSAGE_LENGTH = 500
 DEFAULT_VOICE_SUCCESS_AUDIO_SOURCE = VOICE_SUCCESS_AUDIO_SOURCE_DISABLED
 VOICE_SUCCESS_AUDIO_TIMING_AFTER_SUCCESS = "after_success"
 VOICE_SUCCESS_AUDIO_TIMING_PRIORITY = "priority"

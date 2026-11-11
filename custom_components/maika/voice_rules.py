@@ -72,6 +72,26 @@ def _simple_actions(*actions: str) -> dict[str, _VoiceActionSpec]:
     return {action: _spec() for action in actions}
 
 
+def _field_schema(
+    validator: ServiceDataValidator, **schema: Any
+) -> ServiceDataValidator:
+    validator.voice_field_schema = schema
+    return validator
+
+
+def _describe_field(validator: ServiceDataValidator) -> dict[str, Any]:
+    schema = getattr(validator, "voice_field_schema", None)
+    if schema is not None:
+        return dict(schema)
+    if validator is _boolean:
+        return {"type": "boolean"}
+    if validator is _duration:
+        return {"type": "duration"}
+    if validator is _tone:
+        return {"type": "tone", "max_length": MAX_SERVICE_STRING_LENGTH}
+    return {"type": "string", "max_length": MAX_SERVICE_STRING_LENGTH}
+
+
 def _string(value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError("must be a string")
@@ -95,7 +115,7 @@ def _enum(*values: str) -> ServiceDataValidator:
             raise ValueError(f"must be one of: {choices}")
         return normalized
 
-    return validate
+    return _field_schema(validate, type="enum", options=list(values))
 
 
 def _boolean(value: Any) -> bool:
@@ -114,7 +134,7 @@ def _number(minimum: float, maximum: float) -> ServiceDataValidator:
             raise ValueError(f"must be between {minimum:g} and {maximum:g}")
         return value
 
-    return validate
+    return _field_schema(validate, type="number", min=minimum, max=maximum)
 
 
 def _integer(minimum: int, maximum: int) -> ServiceDataValidator:
@@ -129,7 +149,7 @@ def _integer(minimum: int, maximum: int) -> ServiceDataValidator:
             raise ValueError(f"must be between {minimum} and {maximum}")
         return int(value)
 
-    return validate
+    return _field_schema(validate, type="integer", min=minimum, max=maximum)
 
 
 def _sequence(*validators: ServiceDataValidator) -> ServiceDataValidator:
@@ -140,7 +160,9 @@ def _sequence(*validators: ServiceDataValidator) -> ServiceDataValidator:
             validator(item) for validator, item in zip(validators, value, strict=True)
         )
 
-    return validate
+    return _field_schema(
+        validate, type="sequence", items=[_describe_field(item) for item in validators]
+    )
 
 
 def _tone(value: Any) -> int | str:
@@ -334,7 +356,8 @@ _VOICE_SERVICE_SPECS: dict[str, dict[str, _VoiceActionSpec]] = {
     },
     "script": _simple_actions("turn_on", "turn_off", "toggle"),
     "automation": {
-        **_simple_actions("trigger", "turn_on", "turn_off", "toggle"),
+        **_simple_actions("turn_on", "turn_off", "toggle"),
+        "trigger": _spec({"skip_condition": _boolean}),
     },
     "button": {"press": _spec()},
     "input_button": {"press": _spec()},
@@ -429,6 +452,14 @@ _VOICE_SERVICE_SPECS: dict[str, dict[str, _VoiceActionSpec]] = {
     },
     "lawn_mower": _simple_actions("start_mowing", "pause", "dock"),
     "lock": {"lock": _spec()},
+    "sensor": {},
+    "binary_sensor": {},
+}
+
+READ_VOICE_ACTION = "read"
+_VOICE_SERVICE_SPECS = {
+    domain: {**actions, READ_VOICE_ACTION: _spec()}
+    for domain, actions in _VOICE_SERVICE_SPECS.items()
 }
 
 ALLOWED_VOICE_ACTIONS = frozenset(
@@ -436,6 +467,24 @@ ALLOWED_VOICE_ACTIONS = frozenset(
     for domain_actions in _VOICE_SERVICE_SPECS.values()
     for action in domain_actions
 )
+
+
+def voice_action_catalog() -> dict[str, dict[str, Any]]:
+    """Describe the same allow-list used to validate and execute voice rules."""
+    return {
+        domain: {
+            action: {
+                "fields": {
+                    name: _describe_field(validator)
+                    for name, validator in spec.fields.items()
+                },
+                "required": sorted(spec.required),
+                "exclusive": [sorted(group) for group in spec.mutually_exclusive],
+            }
+            for action, spec in actions.items()
+        }
+        for domain, actions in _VOICE_SERVICE_SPECS.items()
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,8 +500,15 @@ class VoiceCommandRule:
     )
 
     @property
-    def service(self) -> str:
+    def is_read(self) -> bool:
+        """Return whether this rule reads an entity state instead of calling a service."""
+        return self.action == READ_VOICE_ACTION
+
+    @property
+    def service(self) -> str | None:
         """Return the fully qualified Home Assistant service name."""
+        if self.is_read:
+            return None
         return f"{self.entity_id.partition('.')[0]}.{self.action}"
 
 
@@ -593,6 +649,43 @@ def _parse_service_data(domain: str, action: str, raw_value: str) -> Mapping[str
     return MappingProxyType(validated)
 
 
+def replace_voice_command_rule_entity_id(
+    value: str, old_entity_id: str, new_entity_id: str
+) -> str:
+    """Rewrite the entity column when Home Assistant renames an entity ID."""
+    if not isinstance(value, str):
+        return value
+    old_entity_id = str(old_entity_id).strip().casefold()
+    new_entity_id = str(new_entity_id).strip().casefold()
+    if old_entity_id == new_entity_id:
+        return value
+    if not _ENTITY_ID_PATTERN.fullmatch(old_entity_id):
+        return value
+    if not _ENTITY_ID_PATTERN.fullmatch(new_entity_id):
+        return value
+
+    changed = False
+    lines: list[str] = []
+    for raw_line in value.splitlines(keepends=True):
+        body = raw_line.rstrip("\r\n")
+        ending = raw_line[len(body) :]
+        stripped = body.strip()
+        if not stripped or stripped.startswith("#"):
+            lines.append(raw_line)
+            continue
+        parts = body.split("|", 3)
+        if len(parts) < 3 or parts[1].strip().casefold() != old_entity_id:
+            lines.append(raw_line)
+            continue
+        column = parts[1]
+        leading = column[: len(column) - len(column.lstrip())]
+        trailing = column[len(column.rstrip()) :]
+        parts[1] = f"{leading}{new_entity_id}{trailing}"
+        lines.append("|".join(parts) + ending)
+        changed = True
+    return "".join(lines) if changed else value
+
+
 def parse_voice_command_rules(value: str) -> tuple[VoiceCommandRule, ...]:
     """Parse safe rules using three or four columns.
 
@@ -630,13 +723,22 @@ def parse_voice_command_rules(value: str) -> tuple[VoiceCommandRule, ...]:
                 "expected 'phrase | entity_id | action [| JSON service data]'",
             )
 
-        phrase, entity_id, action = parts[:3]
-        normalized_phrase = normalize_voice_phrase(phrase)
-        if not normalized_phrase:
-            raise VoiceCommandRulesError(line_number, "phrase cannot be empty")
-        if len(normalized_phrase) > MAX_PHRASE_LENGTH:
+        phrase_text, entity_id, action = parts[:3]
+        phrases = [part.strip() for part in phrase_text.split(",")]
+        normalized_phrases: list[tuple[str, str]] = []
+        for phrase in phrases:
+            normalized_phrase = normalize_voice_phrase(phrase)
+            if not normalized_phrase:
+                raise VoiceCommandRulesError(line_number, "phrase cannot be empty")
+            if len(normalized_phrase) > MAX_PHRASE_LENGTH:
+                raise VoiceCommandRulesError(
+                    line_number,
+                    f"phrase must be at most {MAX_PHRASE_LENGTH} characters",
+                )
+            normalized_phrases.append((" ".join(phrase.split()), normalized_phrase))
+        if len(rules) + len(normalized_phrases) > MAX_VOICE_COMMAND_RULES:
             raise VoiceCommandRulesError(
-                line_number, f"phrase must be at most {MAX_PHRASE_LENGTH} characters"
+                line_number, f"at most {MAX_VOICE_COMMAND_RULES} rules are allowed"
             )
 
         entity_id = entity_id.casefold()
@@ -667,21 +769,22 @@ def parse_voice_command_rules(value: str) -> tuple[VoiceCommandRule, ...]:
         except ValueError as err:
             raise VoiceCommandRulesError(line_number, str(err)) from err
 
-        if normalized_phrase in seen_phrases:
-            raise VoiceCommandRulesError(
-                line_number,
-                "normalized phrase duplicates an earlier rule",
-            )
+        for phrase, normalized_phrase in normalized_phrases:
+            if normalized_phrase in seen_phrases:
+                raise VoiceCommandRulesError(
+                    line_number,
+                    "normalized phrase duplicates an earlier rule",
+                )
 
-        seen_phrases.add(normalized_phrase)
-        rules.append(
-            VoiceCommandRule(
-                phrase=" ".join(phrase.split()),
-                normalized_phrase=normalized_phrase,
-                entity_id=entity_id,
-                action=action,
-                service_data=service_data,
+            seen_phrases.add(normalized_phrase)
+            rules.append(
+                VoiceCommandRule(
+                    phrase=phrase,
+                    normalized_phrase=normalized_phrase,
+                    entity_id=entity_id,
+                    action=action,
+                    service_data=service_data,
+                )
             )
-        )
 
     return tuple(rules)

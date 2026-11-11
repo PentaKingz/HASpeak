@@ -1,0 +1,407 @@
+# Phân tích APK và API MAIKA
+
+## Phạm vi
+
+Phân tích tĩnh và kiểm tra động có giới hạn trên gói APK/XAPK do người dùng cung cấp. Mục tiêu là tìm API cần thiết để tích hợp loa MAIKA với Home Assistant mà không dùng lệnh phá hủy hoặc thay đổi trạng thái ngoài ý muốn.
+
+Ngày chốt kết quả: **2026-08-15**.
+
+## Nhận dạng gói
+
+| Thuộc tính | Giá trị |
+|---|---|
+| File đầu vào | `MAIKA Virtual Assistant_3.2.3.zip` |
+| Package | `olli.ai.com.maika` |
+| Version name | `3.2.3` |
+| Version code | `170` |
+| Min SDK | `24` |
+| Target SDK | `36` |
+| SHA256 ZIP | `26cffcbbaf5bb37c2a2cb2b3d481777b88eba31f98e33d0b07068a0104528fdc` |
+| SHA256 base APK | `3cc8b19489f3274bc7f3bf14e9826605eed48bed7f402d3dbb028e5b10ddb6d7` |
+| JADX | `1.5.6` |
+| apktool | `3.0.3` |
+
+Gói ZIP chứa base APK, split ABI `armeabi_v7a`, split density `mdpi`, icon và manifest bundle.
+
+## Kiến trúc cloud tìm thấy
+
+| Host | Vai trò trong integration |
+|---|---|
+| `https://users.iviet.com` | Login, danh sách loa, detail loa, cập nhật setting, danh sách giọng |
+| `https://chatbot.iviet.com` | Gửi command và nhận stream event |
+| `https://smarthome.iviet.com` | Linking/sync nhà thông minh; chỉ dùng trong nghiên cứu, không dùng bởi integration |
+| `https://content-gateway.maika.ai` | Chat AI (`/api/chat`) và TTS của ứng dụng; integration dùng `/api/chat` từ `1.29.6`, không dùng TTS |
+
+Tất cả kết nối trong integration dùng HTTPS thông qua shared `aiohttp` session của Home Assistant.
+
+## Xác thực
+
+### Login
+
+#### Số điện thoại
+
+```http
+POST https://users.iviet.com/v1/auth/otp/login
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "phone_number": "<phone>",
+  "password": "<password>"
+}
+```
+
+#### Email/Gmail với mật khẩu MAIKA
+
+```http
+POST https://users.iviet.com/v1/auth/login
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "device_id": "<client-id>",
+  "email": "<email>",
+  "password": "<maika-password>"
+}
+```
+
+APK còn có nút Google Sign-In dùng Google ID token gửi tới
+`/auth/social/login`. Đây là OAuth social login, không phải email/mật khẩu và
+không thể thay bằng mật khẩu Gmail. Integration hiện hỗ trợ email/Gmail khi tài
+khoản đã có mật khẩu MAIKA.
+
+Response thành công chứa `access_token`, `refresh_token`, user `id` và `expire_time`. APK 3.2.3 không cho thấy một refresh endpoint đủ tin cậy để dùng độc lập. Integration do đó:
+
+1. Chỉ giữ access token trong bộ nhớ.
+2. Không lưu refresh token.
+3. Đăng nhập lại bằng credential khi token hết hạn hoặc request nhận 401.
+4. Chỉ retry authentication một lần cho mỗi request để tránh vòng lặp vô hạn.
+
+### Hai kiểu Authorization
+
+- REST `users.iviet.com`: `Authorization: Bearer <access_token>`.
+- Chatbot `/stream` và `/connect`: `Authorization: <access_token>` không có tiền tố `Bearer`.
+
+Đây là khác biệt quan trọng; dùng sai kiểu header sẽ nhận lỗi xác thực.
+
+## REST speaker API
+
+| Method | Endpoint | Trạng thái |
+|---|---|---|
+| `GET` | `/v1/user-device?type=speaker&page=1&limit=100&organization_code=MAIKA` | Đã xác minh live; một số tài khoản có thể trả 5xx |
+| `GET` | `/v1/user-device/{id}` | Đã xác minh live |
+| `PUT` | `/v1/user-device/{id}` | Đã xác minh live với cùng giá trị hiện tại |
+| `GET` | `/v1/user/tts_speaker_voices` | Đã xác minh live |
+
+### Setting được integration cho phép ghi
+
+- `name`
+- `calling_name`
+- `address`
+- `wakeword_sensitivity_level`
+- `wakeword_response_type`
+- `tts_voice`
+
+Body PUT gồm `id`, `device_id` và trường thay đổi.
+
+### Trường cố ý không cho ghi
+
+- `status`: ý nghĩa vòng đời/activation chưa đủ chắc chắn.
+- `avatarURL`: API cập nhật avatar riêng chưa được xác minh.
+- SIP credential: dữ liệu bí mật, chỉ phục vụ tính năng gọi điện nội bộ.
+- Mọi field không nằm trong allowlist.
+
+## Chatbot command protocol
+
+Command được gửi bằng:
+
+```http
+POST https://chatbot.iviet.com/stream
+Content-Type: application/octet-stream
+meta: <Base64 JSON>
+```
+
+`meta` sau khi Base64 decode có dạng:
+
+```json
+{
+  "event": {
+    "header": {
+      "dialogRequestId": "<uuid>",
+      "messageId": "messageId-<uuid>",
+      "name": "SetVolume",
+      "namespace": "SystemControl"
+    },
+    "payload": {
+      "deviceId": "<speaker serial>",
+      "volume": 50
+    }
+  }
+}
+```
+
+Các header phụ quan trọng gồm `device-id`, `device-type`, `version-info`, `olli-session-id`, `source`, `client-version`, `user-id`, `language-code` và `Authorization` raw token. Khi nhắm một loa cụ thể, request đặt `device-id` = serial loa và `olli-session-id` = serial loa (`com.maika.data.remove.header.a:125-129` + `ChatBotHeaderInterceptor`); không có loa thì dùng giá trị client Android.
+
+## Command đã ánh xạ
+
+| Chức năng | Header name | Namespace | Payload chính | Mức xác minh |
+|---|---|---|---|---|
+| Âm lượng | `SetVolume` | `SystemControl` | `deviceId`, `volume` | Live, gửi cùng giá trị hiện tại |
+| Lấy trạng thái | `GetDeviceInfo` | `ClientInformation` | `deviceId`, `fields` | Live |
+| Tắt micro | `Mute` | `Recording` | `deviceId` | Tĩnh từ APK |
+| Bật micro | `Unmute` | `Recording` | `deviceId` | Tĩnh từ APK |
+| Pause | `PauseCommandIssued` | `PlaybackController` | `deviceId` | Tĩnh từ APK |
+| Resume | `ResumeCommandIssued` | `PlaybackController` | `deviceId` | Tĩnh từ APK |
+| Next | `NextCommandIssued` | `PlaybackController` | `deviceId` | Tĩnh từ APK |
+| Previous | `PreviousCommandIssued` | `PlaybackController` | `deviceId` | Tĩnh từ APK |
+| Stop (qua pause) | `PauseCommandIssued` | `PlaybackController` | `deviceId` | Chưa xác minh được lệnh stop riêng; báo `paused`, giữ vị trí, từ `1.17.0` |
+| Jump item | `JumpCommandIssued` rồi `ResumeCommandIssued` | `PlaybackController` | `deviceId`, `songKey` | Tĩnh từ APK; không phải seek theo giây, dùng cho queue native từ `1.18.0`; gửi resume ngay sau jump từ `1.29.4` |
+| Gửi câu lệnh gõ (chat) | `Recognize` | `SpeechRecognizer` | `rawSpeech` | Tĩnh từ APK (`MainViewController.java:955-1015`); mục Trò chuyện từ `1.20.0` |
+| Bắt đầu mirror hội thoại | `StartListening` | `Conversation` | `deviceId`, `type=conversation` | Tĩnh từ APK; triển khai từ `1.3.2` |
+| Dừng mirror hội thoại | `StopListening` | `Conversation` | `deviceId`, `type=conversation` | Tĩnh từ APK; best-effort khi unload từ `1.3.2` |
+| Restart | `Reboot` | `SystemControl` | `toDeviceId` | Tĩnh từ APK |
+| Factory reset | `Reset` | `SystemControl` | `toDeviceId` | Tìm thấy nhưng cố ý không expose |
+
+Integration chỉ triển khai các command không phá hủy. `Reset` hoàn toàn không có entity/service.
+
+## Event stream `/connect`
+
+```http
+GET https://chatbot.iviet.com/connect
+```
+
+Response là stream dài hạn với frame:
+
+```text
+$START_JSON
+{...JSON...}
+$END_JSON
+```
+
+Integration:
+
+- Dùng incremental UTF-8 decoder để không làm hỏng tiếng Việt khi byte multibyte bị chia giữa hai chunk.
+- Giữ buffer tối đa 1 MiB.
+- Tự reconnect với exponential backoff 1–60 giây.
+- Chờ frame handshake tối đa 30 giây; stream HTTP 200 nhưng im lặng bị đóng và thử lại.
+- Lỗi ngoài dự kiến không làm listener dừng vĩnh viễn; integration log và tiếp tục vòng reconnect.
+- Tự login lại khi stream nhận 401.
+- Hủy task và waiter đúng lúc unload config entry.
+
+### `DeviceInfo`
+
+`GetDeviceInfo` yêu cầu các field:
+
+```text
+current_playback,volume,latest_playlist,device_id,mute
+```
+
+Cloud trả directive `ClientInformation/DeviceInfo`; integration merge dữ liệu này với REST detail để có volume, mute và playback gần thời gian thực.
+
+Từ bản `1.8.1`, nếu REST danh sách loa trả 5xx hoặc response sai cấu trúc,
+integration gửi `GetDeviceInfo` không kèm `deviceId` để cloud trả loa mặc định.
+Payload discovery được chuẩn hóa từ camelCase/snake_case, cache theo serial và
+đặt `online=true` khi chính loa đã phản hồi. Nhờ đó tài khoản vẫn tạo được loa
+dù API `users.iviet.com` tạm lỗi; REST detail và danh sách giọng lỗi chỉ làm mất
+một số metadata/tùy chọn, không chặn các command stream an toàn.
+
+### `speakerConversationResponse`
+
+APK xử lý directive có `header.type = speakerConversationResponse`. `HeaderDirective` chứa `rawSpeech`, `sessionId`, `messageId` và metadata khác. Đây là điểm vào của sensor câu lệnh và rule entity Home Assistant.
+
+Rà soát bổ sung ngày **2026-08-16** tìm thấy bước đăng ký còn thiếu trong bản `1.3.1`: khi mở màn hình lịch sử hội thoại của loa, APK gửi `Conversation/StartListening` với `deviceId` của loa và `type = conversation`; khi rời màn hình, APK gửi `StopListening`. Bản `1.5.0` gửi `StartListening` cho từng loa khi voice sensor/rule được bật, đăng ký lại theo từng thế hệ `/connect` và dừng best-effort lúc unload.
+
+Parser `1.3.2` cũng chấp nhận directive nằm trực tiếp ở root hoặc trong wrapper `directive`, `event`, `message`, `response`, `data`. Telemetry chỉ lưu loại frame và các trường header giới hạn 128 ký tự; raw payload, token, credential và serial không được đưa vào sensor chẩn đoán.
+
+Integration chỉ xử lý `rawSpeech` khi:
+
+1. Sensor/rule câu lệnh được bật thủ công.
+2. Type đúng `speakerConversationResponse`.
+3. Nội dung câu nói là chuỗi không rỗng.
+4. Message chưa được xử lý trong cửa sổ dedupe 5 phút.
+
+Câu không khớp rule vẫn cập nhật sensor nhưng không gọi service entity hoặc gửi lệnh audio tới loa.
+
+## Chat AI
+
+APK dùng `POST https://content-gateway.maika.ai/api/chat` cho màn hình chat AI. Request JSON gồm `message`, `enable_search` (mặc định `false`) và `session_id` dạng `<user_id>_<install_id>`. Header dùng `Authorization: Bearer <access_token>`, `device-type: android`, `version-info: 3.2.3`, `timezone`, `language-code`.
+
+Response là body text stream, không phải JSON từng dòng; app đọc từng chunk UTF-8 và nối vào câu trả lời đang hiển thị. Từ `1.29.6`, integration gọi endpoint này sau khi gửi `Recognize`, dùng `session_id` ổn định `<user_id>_<client_id>` và thêm câu trả lời hoàn chỉnh vào chat log.
+
+Từ `1.29.8`, hai request chat dùng `retry_auth=False` để không xóa token hay đăng nhập lại khi gặp 401, tránh tác động tới event stream và lệnh giọng nói.
+
+Từ `1.29.7`, nếu endpoint AI lỗi hoặc trả rỗng, integration gọi `GET https://users.iviet.com/v2/user/message-history?limit=10&page=0&device_id=<serial>&newest=true`, đối chiếu `data[].data.header.rawSpeech` với câu vừa gửi rồi lấy `data[].data.response.items[].simpleResponse.displayText`. Đây là nguồn câu trả lời thật của loa; directive TTS vẫn là lớp dự phòng cuối.
+
+## Nghiên cứu TTS
+
+APK có hai đường TTS đáng chú ý:
+
+1. `POST https://content-gateway.maika.ai/api/command/speak` với `SpeakRequest`; response body được ứng dụng tiêu thụ như audio.
+2. `TextToSpeech/StreamAudio` qua chatbot với payload `text`, `encodeFormat`, `language`, `voiceCode` và tùy chọn `deviceId`.
+
+Kiểm tra ngày 2026-08-15 cho thấy `StreamAudio` trả HTTP 200 với body binary/non-JSON trực tiếp cho HTTP client và không quan sát thấy directive mới trên session `/connect` trong 12 giây. Điều này phù hợp với code APK dùng response làm audio preview trong ứng dụng.
+
+Endpoint TTS này vẫn không được dùng để phát trực tiếp trên loa vì response là audio dành cho HTTP client. Thay vào đó, nghiên cứu tiếp theo tìm thấy protocol media handover riêng của ứng dụng.
+
+## Cloud media handover
+
+APK 3.2.3 có lệnh cast từ ứng dụng điện thoại tới loa vật lý:
+
+- Outer header: `CommandHandOver`, namespace `SystemControl`.
+- Nested event header: `Play`, namespace `AudioPlayer`.
+- `fromDeviceId`: device/client ID của ứng dụng.
+- `toDeviceId`: danh sách serial loa được chọn.
+- `mediaCard`: `format`, `title`, URL trực tiếp và media `type`.
+- `mediaOffset`: offset mili giây.
+
+Call site audio tạo `MediaCard`, giữ `streamFormat` động do message cloud cung cấp và đặt fallback `format = AUDIO_MPEG` khi chuỗi này rỗng, rồi gửi `MetaStreamCastingMediaRequest` bằng cùng sender `/stream` với command hiện có. Khi không kế thừa một media message cũ, app tự tạo `dialogRequestId` và `messageId` mới.
+
+Sender APK nhận `ResponseBody` nhưng không parse nội dung khi request thành công. Client Python vì vậy chỉ dùng HTTP status và trường JSON `status=false` nếu body tình cờ là JSON; body 2xx dạng text/binary được coi là acknowledgement hợp lệ.
+
+Integration `1.1.0` ánh xạ đường này thành `media_player.play_media` opt-in:
+
+1. `fromDeviceId` dùng config-entry client ID hiện có.
+2. `toDeviceId` luôn là list chỉ chứa serial của entity được gọi.
+3. Payload cố định `type = audio`, `format = AUDIO_MPEG`, offset `0`.
+4. Home Assistant media source được resolve trước khi gửi.
+5. Chỉ URL HTTP(S) hợp lệ được chấp nhận; không expose raw command.
+
+Rà soát bổ sung ngày 2026-08-16 xác nhận APK không chứa playback command `Stop` hoặc seek theo mili giây. Enum chỉ có pause, resume, next, previous và `JumpCommandIssued`; jump nhận `songKey`, nên integration không ánh xạ nó thành `media_player.seek`.
+
+Từ `1.18.0`, integration dùng `JumpCommandIssued` cho **queue native** trên loa: `BROWSE_MEDIA` trả playlist `latest_playlist.songs` (mỗi bài có `songKey`, `song`, `artist`) dưới dạng `media_content_type` `maika_playlist`/`maika_song`; chọn bài gửi `JumpCommandIssued` với `songKey` sau khi đọc lại playlist và xác minh bài còn trong queue của đúng loa. Từ `1.29.4`, integration gửi thêm `ResumeCommandIssued` ngay sau jump để bài vừa chọn phát luôn, kể cả khi loa đang tạm dừng. ID queue là `maika:<sha256 revision>:<songKey urlencode>`; integration không dựng playlist giả từ lịch sử, URL cast hay suy luận câu nói. Queue này hoạt động kể cả khi tắt cloud cast. Bản `1.2.0` chấp nhận MIME MP4/AAC nhưng vẫn dùng fallback `AUDIO_MPEG` đã xác minh để firmware tự nhận dạng nội dung URL. Từ `1.17.0`, lệnh `STOP` của media player gửi `PauseCommandIssued`, báo `paused` và giữ vị trí để phát tiếp; không giả reset bài hoặc gửi directive `Stop` chưa được kiểm chứng.
+
+Từ `1.29.1`, khi metadata bài đổi qua `songKey`/`key`/`url`/`id` hoặc tên bài (`title`/`song`/`name`), integration bỏ `offsetInMilliseconds` và thời lượng của bài trước thay vì merge tiếp. Chọn bài trong queue native và previous/next cũng cập nhật optimistic tên bài, ca sĩ, vị trí `0:00` và xóa URL cast cũ; event live vẫn là nguồn xác nhận cuối cùng.
+
+Schema đã được xác minh tĩnh từ APK nhưng chưa được xác nhận bằng phát âm thanh trên loa vật lý trong bản bàn giao này. Do đó feature mặc định tắt và được ghi rõ là thử nghiệm.
+
+## Content Store (thư viện giải trí)
+
+APK 3.2.3 có **Content Store** riêng cho nhạc, podcast, radio, kênh và nội dung nổi bật. App không dùng REST `/api` cho phần này mà gọi Apollo GraphQL tới `https://core.ocs.iviet.com/v1/graphql`. Xác thực dùng cùng MAIKA user access token (`Authorization: Bearer <token>`), kèm các header `device-type: android`, `version-info: 3.2.3`, `language-code` và `timezone` (`lj/b.java`, `kj/b.java`, `ri/j0.java`). Repository `com.maika.data.repositoryimpl.APIGraphQLRepositoryImpl*` và các tài liệu operation trong package `pi` chứa khoảng 44 operation.
+
+Integration `1.19.0` chỉ triển khai các read operation cần để duyệt (trong `custom_components/maika/content_store.py`) và gửi qua `MaikaApiClient.async_graphql`:
+
+- `ContentChannels`: `media_channel` → kênh (`id`, `name`, `slug`, `cover`).
+- `ContentChannelMedias`: `media_channel_by_pk(id:)` → `categories` (`rel_channel_category`) → `category` → `medias` (`rel_media_category`) → `media` (`audio`, `cover`, `description`, `duration`, `id`, `title`, `_type { description value }`). Từ `1.21.1`, `medias` nằm dưới `category`; API hiện tại không còn field `medias` trực tiếp trên `rel_channel_category`. Từ `1.20.1` chọn đúng `_type`; thêm lọc `media.is_published`. Từ `1.29.1`, query lọc thêm `media.media_channel_id = $id` và panel hiển thị `category` thành thư mục con `maika_cs_channel_category:<channel>:<category>` thay vì gộp phẳng.
+- `ContentCategories`: `media_type` → các thể loại nổi bật (`value`, `description`, `icon`, `bg_color`).
+- `ContentHighlights`: `highlights(media_type:)` → nội dung nổi bật theo thể loại (`id`, `title`, `type`, `is_list`, `cover`).
+- `ContentEpisodes`: `media_episode_details(id:)` → danh sách tập/bài của một media (`audio`, `duration`, `id`, `title`).
+
+`async_validate` gọi `ContentCategories` như phép thử readiness. `async_graphql` lặp lại xác thực một lần khi gặp `401` giống các request REST khác. Query bị giới hạn `_MAX_ITEMS = 50` mỗi lần.
+
+Phát nội dung: node media có sẵn trường `audio` và không phải list được coi là bài phát trực tiếp (track), còn lại mở rộng qua `media_episode_details`. URL `audio` của track được cast lên loa qua đúng đường `MetaStreamCastingMediaRequest` → `CommandHandOver/SystemControl` + `Play/AudioPlayer` với fallback `AUDIO_MPEG` đã xác minh, nên cần option `enable_experimental_cloud_cast`.
+
+Ánh xạ cây duyệt Home Assistant (thêm từ `1.19.0`):
+
+- `maika_cs_root` → `maika_cs_channels`, `maika_cs_categories`, `maika_cs_highlights`.
+- `maika_cs_channels` → `maika_cs_channel:<id>` → media (`maika_cs_media:<id>` nếu là list) → bài `maika_cs_track`.
+- `maika_cs_categories` → `maika_cs_category:<value>` (highlights theo `media_type`).
+- `maika_cs_highlights` → node media trực tiếp.
+- Bài: `media_content_type = maika_cs_track`, `media_content_id` = URL `audio`.
+
+Duyệt Content Store không cần cloud cast (chỉ cần entity available), nhưng `play_media` cho `maika_cs_track` vẫn gate theo cờ cloud cast.
+
+Schema và semantics field được xác minh tĩnh từ APK và kiểm thử bằng mock (`scripts/test_content_store.py`, `scripts/test_media_player.py`), chưa gọi API thật hoặc phát trên loa vật lý. Vì vậy duyệt có thể lỗi nếu API trả field khác; lỗi được báo qua `maika_content_store_failed`.
+
+## NhạcCủaTui
+
+Từ `1.22.0`, integration thêm nguồn **NhạcCủaTui** vào Thư viện giải trí MAIKA; từ `1.22.1` mục này cũng nằm trực tiếp dưới gốc **MAIKA** trong trình duyệt media. Từ `1.23.0`, integration hỗ trợ tìm kiếm qua API search và `media_player/search_media`. Đây là API công khai của NhạcCủaTui mà app MAIKA không gọi trực tiếp trong APK 3.2.3; integration gọi thẳng API web để lấy dữ liệu và stream.
+
+- Base: `https://graph.nhaccuatui.com/api/v1/`.
+- **Bài hát mới**: `GET song/feed?pageindex=1&pagesize=50`. Mỗi item có `key`, `name`, `artistName`, `duration`, ảnh `image`/`imageShare` và mảng `streamURL`; mỗi phần tử stream có `stream`, `type` (`128`, `320`, `lossless`), `onlyVIP`, `status`.
+- **Top thịnh hành**: `GET playlist/charts` trả các chart (`key`, `title`, `titleDetail`, `image`); `GET app/charts/more?chartKey=<chart>&pageindex=1&pagesize=50` trả danh sách bài của chart.
+- **Tìm kiếm**: `GET search/song?keyword=<q>&pageindex=1&pagesize=50&correct=false` trả `data.songs`; item cùng cấu trúc với feed. Integration bỏ item thiếu `key`, chuẩn hóa stream như các luồng khác. Media player trả kết quả qua `media_player/search_media` với `maika_nct_track`.
+- Không cần token/header đặc biệt. Response JSON có `data` bọc danh sách hoặc object.
+- Chọn stream trong `streamURL`: bỏ option `status != 1`, ưu tiên option không `onlyVIP`, rồi tới thứ tự `320` → `128` → `lossless`. Integration không chọn link cần quyền VIP nếu còn lựa chọn công khai. URL stream có thể hết hạn, nên resolve lại ở thời điểm phát thay vì lưu lâu dài.
+- Phát qua đúng cloud cast MAIKA (`enable_experimental_cloud_cast`). Có thể gọi trực tiếp `media_player.play_media` với `https://www.nhaccuatui.com/song/<key>`, link `/bai-hat/...<key>.html`, hoặc `nct:<key>`; media player resolve key rồi cast URL stream.
+- Cây duyệt dùng `maika_nct_root`, `maika_nct_feed`, `maika_nct_charts`, `maika_nct_chart:<key>`, và track có `media_content_type` `maika_nct_track` với `media_content_id` là `<key>`; panel nhận `maika_nct_track` nhưng vẫn dùng `media_player.play_media` chuẩn.
+
+Đã kiểm tra API trực tiếp: feed trả bài, `playlist/charts` trả 12 chart, chart trả tối đa 50 bài, detail trả stream 320; search `sơn tùng` trả `total: 42763`, `loadmore: true`, có stream 128/320/lossless. Chưa kiểm thử cast/phát trên loa thật.
+
+## Bài hát yêu thích và nhắc hẹn
+
+Hai nhóm API này dùng chung host tài khoản `https://users.iviet.com` và token đăng nhập MAIKA hiện có.
+
+- **Playlist yêu thích**: response login `data.favorite_playlist_id` (Integer, có thể null). Nếu có, integration gọi `GET /v1/playlists/{id}/songs?page=1&limit=100&order_by=latest`; response `data.songs`, `meta_data.total_page`, mỗi bài có `songKey`, `song`/`name`, `artist`, `url`, `imageURL`. Integration đọc tiếp các trang còn lại (tối đa 50 trang) để lấy toàn bộ danh sách; chỉ bài có `url` HTTP(S) hợp lệ mới được đưa vào trình duyệt media. Từ `1.29.2`, nếu login không trả ID, integration gọi `GET /v1/playlist?page=1&limit=1000&order_by=oldest` và chọn playlist có tiêu đề **Bài hát yêu thích** / **Favorite(s)**; nếu danh sách đầu tiên rỗng thì thử lại bằng ID tìm theo tên.
+- **Thêm vào yêu thích**: `POST /v1/playlists/{favorite_playlist_id}/songs` với body `singer`, `song_id`, `song_name`, `song_url`, `lyric`, `status`, `imageURL`; app 3.2.3 lấy `key`, `name`, `artist`, `url`, `lyric`, `image.url` từ bài đang phát và dùng `status=0`, không gửi `source` (null bị bỏ khi serialize). Từ `1.29.2`, integration gửi đúng payload này thay vì `source=nct`, `status=1`. Từ `1.29.4`, khi playback thiếu `key`/`songKey`, integration đối chiếu `latest_playlist` bằng `songKey`, tên bài hoặc queue chỉ có một bài để lấy ID, tên, ca sĩ và URL. Chưa kiểm thử POST trên tài khoản thật.
+- **Danh sách nhắc hẹn**: `GET /v1/reminder?page=0&limit=1000` trả `data` là mảng nhóm; mỗi nhóm có `date` và `listReminders` (camelCase). Mỗi reminder có `id`, `event`/`reminder`, `start_date`, `start_time`, `timezone`, `frequency`, `completed`, `status`, `reminder_type`, `alarm_type`, `custom_tts`, `devices`. Interface còn nhận `user_id`, `completed`, `from_date`, `to_date`, `status`, `reminder_type` để lọc. `POST /v1/reminder/sync` chỉ trả `SuccessResponse` (đồng bộ cloud), không trả danh sách.
+- **Tạo nhắc hẹn**: `POST /v1/reminder` với body snake_case: `alert_prior` (giây), `event`, `executor`, `frequency`, `num_alert`, `period_time`, `reminder_type`, `start_date` (`yyyy-MM-dd`), `start_time` (`HH:mm:ss`), `timezone`, `repeat_per_alert`, `devices` (mảng serial), `alarm_type`, `custom_tts`. Integration dùng executor `vn_south`, kiểu TTS (`alarm_type=1`), một lần báo (`num_alert=1`) và bỏ field rỗng thay vì gửi null.
+- **Xóa nhắc hẹn**: `DELETE /v1/reminder/{id}` với body `{"executor": "vn_south", "all": false, "reminder_ids": [id]}`.
+- Tần suất hỗ trợ: `once`, `daily`, `weekly`, `monthly`, `yearly`. Panel giới hạn báo trước 0–1440 phút, nội dung 200 ký tự, lời đọc 500 ký tự và từ chối thời gian trong quá khứ quá 60 giây.
+- Đã xác minh tĩnh từ APK 3.2.3 (`CreateReminderRequest`, `DeleteReminderRequest`, `AllReminderResponse`, `DataAllReminder`, `Reminders`, use case `GetAllReminder`, `Data.favorite_playlist_id`). Chưa kiểm thử tạo/xóa trên tài khoản thật hoặc phát nhắc trên loa vật lý.
+
+## Smart-home linking
+
+APK mới và APK lịch sử 2.5.0 lấy danh sách partner/OAuth hoàn toàn từ backend `smarthome.iviet.com`; không có cấu hình Home Assistant cố định trong app.
+
+Trên tài khoản test tại thời điểm phân tích:
+
+- Các biến thể API partner v1 đến v1.4 không trả provider HASS/Home Assistant.
+- `linking/status?partner=HASS` có thể trả linked do dấu vết lịch sử.
+- `intent/sync` vẫn trả danh sách thiết bị rỗng.
+- Không thực hiện unlink để tránh thay đổi tài khoản.
+
+Kết luận: custom integration/add-on cục bộ không thể tự thêm provider HASS vào inventory MAIKA. Việc này cần backend OLLI mở lại provider, OAuth redirect/callback và adapter sync/control tương ứng.
+
+## Dữ liệu detail và quyết định entity
+
+REST detail còn chứa các nhóm dữ liệu như SIP, profile/persona, metadata, local media, TSSV config và cấu hình nội bộ. Chúng không được biến thành entity vì một hoặc nhiều lý do:
+
+- Bí mật hoặc nhận dạng cá nhân.
+- Không có ngữ nghĩa ổn định.
+- Là object lớn/opaque, không phù hợp state model của Home Assistant.
+- Trùng với device registry hoặc entity an toàn khác.
+
+Danh sách 27 entity an toàn/hữu ích nằm trong `docs/ENTITIES.md`.
+
+## Ma trận xác minh
+
+| Hạng mục | Kết quả |
+|---|---|
+| SHA256 và bundle manifest | Pass |
+| Login test account | Pass |
+| List/detail/voice REST | Pass |
+| `/connect` session | Pass |
+| `GetDeviceInfo` live | Pass |
+| `SetVolume` cùng giá trị | Pass, không đổi âm lượng |
+| PUT wakeword sensitivity cùng giá trị | Pass, không đổi setting |
+| Parser frame JSON | Pass |
+| Parser prefix Assist | Pass, gồm dấu câu/không dấu |
+| Python compile | Pass |
+| JSON validation | Pass |
+| Ruff lint/format | Pass |
+| HA loader 2026.2.3 | Pass |
+| 27 entity smoke test 2026.2.3 | Pass |
+| Đối chiếu source HA 2026.8.1 | Pass |
+| `CommandHandOver` media cast trong APK | Pass, xác minh tĩnh |
+| `media_player.play_media` payload/build | Pass, kiểm thử local không gửi cloud |
+| Cloud cast phát trên loa vật lý | Chưa xác minh |
+| NhạcCủaTui API feed/chart/detail live | Pass |
+| NhạcCủaTui search API live | Pass, `sơn tùng` trả 42.763 bài |
+| `media_player/search_media` + panel search | Pass, mock HA 2026.2.3 và browser |
+| NhạcCủaTui cast trên loa vật lý | Chưa xác minh |
+| Favorite/reminder endpoint + payload | Pass, mock API và browser |
+| Playlist yêu thích trên tài khoản thật | Chưa xác minh |
+| Tạo/xóa nhắc hẹn trên tài khoản thật | Chưa xác minh |
+| Voice command vật lý → Assist | Chưa xác minh |
+| Assist response → loa MAIKA | Không triển khai |
+
+## Nguồn chính
+
+- APK `MAIKA Virtual Assistant 3.2.3` do người dùng cung cấp.
+- APK lịch sử 2.5.0 dùng để so sánh cơ chế partner.
+- Hướng dẫn nhà thông minh OLLI: `https://olli.vn/pages/huong-dan-ket-noi-nha-thong-minh`
+- Bài cập nhật MAIKA 2022: `https://blog.olli.vn/2022/05/27/ban-cap-nhat-mung-sinh-nhat-maika-2022/`
+- Home Assistant config flow: `https://developers.home-assistant.io/docs/config_entries_config_flow_handler/`
+- Home Assistant fetching data: `https://developers.home-assistant.io/docs/integration_fetching_data/`
+- Home Assistant entity model: `https://developers.home-assistant.io/docs/core/entity/`
+- Home Assistant source tag kiểm tra: `https://github.com/home-assistant/core/tree/2026.8.1`
+
+## Cảnh báo bảo trì
+
+Các endpoint không có tài liệu công khai ổn định. Nếu MAIKA đổi version app, host, header hoặc JSON schema, cần decompile lại APK mới, so sánh protocol và kiểm thử bằng lệnh không phá hủy trước khi nâng version integration.
